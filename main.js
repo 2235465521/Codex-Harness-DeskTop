@@ -11,6 +11,7 @@ const { pathToFileURL } = require("url");
 let mainWindow = null;
 let isDownloadingUpdate = false;
 let isQuitting = false;
+let pendingUpdateInstallerPath = null;
 
 const MAX_DOCX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_EXTRACTED_TEXT_CHARS = 80000;
@@ -240,6 +241,10 @@ function isAllowedUpdateDownloadUrl(downloadUrl) {
     host === "github-releases.githubusercontent.com"
   ) {
     return true;
+  }
+  // 加速镜像代理白名单（仅允许针对本仓库 Releases 资产的代理加速）
+  if (host === "ghfast.top" || host === "mirror.ghproxy.com" || host === "ghproxy.net") {
+    return pathname.includes("/Simon-yyy/Codex-Harness-DeskTop/releases/");
   }
   return false;
 }
@@ -650,50 +655,101 @@ function createWindow() {
 // ---------------------------------------------------------------------------
 function downloadFile(url, destPath, onProgress) {
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    const getOptions = { headers: { "User-Agent": "cline/3.0.0" } };
-
-    function doGet(targetUrl) {
-      https.get(targetUrl, getOptions, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return doGet(res.headers.location);
-        }
-        if (res.statusCode !== 200) {
-          file.close();
-          fs.unlink(destPath, () => {});
-          return reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage}`));
-        }
-
-        const totalBytes = parseInt(res.headers["content-length"] || "0", 10);
-        let downloadedBytes = 0;
-
-        res.on("data", (chunk) => {
-          downloadedBytes += chunk.length;
-          file.write(chunk);
-          if (totalBytes > 0 && onProgress) {
-            const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
-            onProgress(percent, downloadedBytes, totalBytes);
-          }
-        });
-
-        res.on("end", () => {
-          file.end();
-          resolve(destPath);
-        });
-
-        res.on("error", (err) => {
-          file.close();
-          fs.unlink(destPath, () => {});
-          reject(err);
-        });
-      }).on("error", (err) => {
-        file.close();
-        fs.unlink(destPath, () => {});
-        reject(err);
-      });
+    const candidateUrls = [url];
+    if (url.includes("github.com/Simon-yyy/Codex-Harness-DeskTop/releases/download/")) {
+      candidateUrls.push(`https://ghfast.top/${url}`);
+      candidateUrls.push(`https://mirror.ghproxy.com/${url}`);
     }
 
-    doGet(url);
+    let candidateIndex = 0;
+
+    function tryDownloadNext() {
+      if (candidateIndex >= candidateUrls.length) {
+        return reject(new Error("所有下载源均尝试失败，请检查网络连接"));
+      }
+      const currentUrl = candidateUrls[candidateIndex++];
+      console.log(`[codex-desktop] 尝试下载更新包 (${candidateIndex}/${candidateUrls.length}):`, currentUrl);
+
+      const file = fs.createWriteStream(destPath);
+      const getOptions = { headers: { "User-Agent": "cline/3.0.0" } };
+      let reqTimeout = null;
+      let hasEnded = false;
+
+      function cleanup() {
+        if (reqTimeout) { clearTimeout(reqTimeout); reqTimeout = null; }
+        try { file.close(); } catch (_) {}
+        try { fs.unlinkSync(destPath); } catch (_) {}
+      }
+
+      function doGet(targetUrl, redirectCount = 0) {
+        if (redirectCount > 5) {
+          cleanup();
+          return tryDownloadNext();
+        }
+
+        const client = targetUrl.startsWith("http:") ? http : https;
+        const req = client.get(targetUrl, getOptions, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            let nextLoc = res.headers.location;
+            if (nextLoc.startsWith("/")) {
+              const prevUrl = new URL(targetUrl);
+              nextLoc = `${prevUrl.origin}${nextLoc}`;
+            }
+            return doGet(nextLoc, redirectCount + 1);
+          }
+
+          if (res.statusCode !== 200) {
+            cleanup();
+            return tryDownloadNext();
+          }
+
+          if (reqTimeout) { clearTimeout(reqTimeout); reqTimeout = null; }
+
+          const totalBytes = parseInt(res.headers["content-length"] || "0", 10);
+          let downloadedBytes = 0;
+
+          res.on("data", (chunk) => {
+            downloadedBytes += chunk.length;
+            file.write(chunk);
+            if (totalBytes > 0 && onProgress) {
+              const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
+              onProgress(percent, downloadedBytes, totalBytes);
+            }
+          });
+
+          res.on("end", () => {
+            if (hasEnded) return;
+            hasEnded = true;
+            file.end();
+            resolve(destPath);
+          });
+
+          res.on("error", () => {
+            if (hasEnded) return;
+            cleanup();
+            tryDownloadNext();
+          });
+        });
+
+        reqTimeout = setTimeout(() => {
+          if (hasEnded) return;
+          console.warn("[codex-desktop] 当前更新源响应超时，正在自动切换备选加速节点...");
+          req.destroy();
+          cleanup();
+          tryDownloadNext();
+        }, 8000);
+
+        req.on("error", () => {
+          if (hasEnded) return;
+          cleanup();
+          tryDownloadNext();
+        });
+      }
+
+      doGet(currentUrl);
+    }
+
+    tryDownloadNext();
   });
 }
 
@@ -812,6 +868,23 @@ function checkForUpdates(isSilent = false) {
   });
 }
 
+function applyPendingUpdate() {
+  if (!pendingUpdateInstallerPath || !fs.existsSync(pendingUpdateInstallerPath)) return false;
+  try {
+    // /S 表示 NSIS 静默覆写安装，自动覆盖历史安装目录，无需用户手动卸载或重选路径
+    spawn(pendingUpdateInstallerPath, ["/S", "--updated"], {
+      detached: true,
+      stdio: "ignore"
+    }).unref();
+    isQuitting = true;
+    app.quit();
+    return true;
+  } catch (err) {
+    dialog.showErrorBox("启动安装程序失败", `无法自动执行安装包: ${err.message}`);
+    return false;
+  }
+}
+
 function startDownloadUpdate(assetUrl, newVersion) {
   if (!isAllowedUpdateDownloadUrl(assetUrl)) {
     console.error("[codex-desktop] 拒绝非白名单更新下载 URL:", assetUrl);
@@ -841,25 +914,23 @@ function startDownloadUpdate(assetUrl, newVersion) {
     }
   }).then(() => {
     isDownloadingUpdate = false;
+    pendingUpdateInstallerPath = installerPath;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("update-downloaded", { version: newVersion, installerPath });
     }
     dialog.showMessageBox(mainWindow || null, {
       type: "info",
-      title: "🎉 下载完成",
-      message: `v${newVersion} 安装包已下载完成！\n点击确定后应用将自动退出并启动安装升级。`,
-      buttons: ["立即安装升级"],
+      title: "🎉 新版本已下载完成",
+      message: `Codex Desktop v${newVersion} 安装包已就绪！\n\n新版本将自动就地覆写升级，老版本无需卸载，所有会话记录与配置 100% 完整保留。`,
+      buttons: ["⚡ 立即重启完成升级", "稍后退出时自动升级"],
       defaultId: 0
-    }).then(() => {
-      try {
-        spawn(installerPath, ["--updated"], {
-          detached: true,
-          stdio: "ignore"
-        }).unref();
-        isQuitting = true;
-        app.quit();
-      } catch (err) {
-        dialog.showErrorBox("启动安装程序失败", `无法自动执行安装包: ${err.message}`);
+    }).then(({ response }) => {
+      if (response === 0) {
+        applyPendingUpdate();
+      } else {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("update-pending-on-quit", { version: newVersion });
+        }
       }
     });
   }).catch((err) => {
@@ -1948,6 +2019,15 @@ ipcMain.handle("start-download-update-action", (_event, { downloadUrl, version }
   }
     startDownloadUpdate(downloadUrl, version);
     return { success: true };
+});
+
+ipcMain.handle("apply-update-now", () => {
+  const ok = applyPendingUpdate();
+  return { success: ok };
+});
+
+ipcMain.handle("apply-update-on-quit", () => {
+  return { success: true, pending: !!pendingUpdateInstallerPath };
 });
 
 // 官方 Codex CLI (Rust / Node @openai/codex) 状态检测适配器
@@ -3366,6 +3446,21 @@ app.whenReady().then(() => {
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on("before-quit", () => {
+  if (pendingUpdateInstallerPath && fs.existsSync(pendingUpdateInstallerPath) && !isQuitting) {
+    try {
+      // /S 参数实现静默覆盖升级，重启应用后即为新版，完全免卸载
+      spawn(pendingUpdateInstallerPath, ["/S", "--updated"], {
+        detached: true,
+        stdio: "ignore"
+      }).unref();
+    } catch (e) {
+      console.error("[codex-desktop] 退出时执行覆写更新失败:", e);
+    }
+  }
+  isQuitting = true;
 });
 
 app.on("window-all-closed", () => {

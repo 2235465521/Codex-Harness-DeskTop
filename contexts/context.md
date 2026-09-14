@@ -35,12 +35,12 @@
 | **Seam 9** | 多模型服务商 | `ui/app.js`, `main.js` | 多协议自适应、API Key 安全落盘与连通性测试 |
 | **Seam 10** | 原生多模态 | `preload.js`, `ui/app.js` | 剪贴板图片拦截 (Ctrl+V)、安全落盘与视觉模型直接传图 |
 | **Seam 11~11.6** | 交互辅助与解析 | `ui/app.js`, `tests/` | ESC 关闭模态框、LLM 返回 HTML 网页防误判、VM 状态机验证 |
-| **Seam 12~13** | 打包与自动更新 | `scripts/release.mjs`, `main.js` | NSIS 安装包构建、SHA-256 归档、GitHub Releases 流式下载 |
+| **Seam 12~13** | 打包与自动更新 | `.github/workflows/release.yml`, `scripts/release.mjs`, `main.js` | GitHub Actions 云端构建、NSIS `/S` 静默覆盖更新、镜像加速与 ADR 0001 决策记录 |
 | **Seam 14** | 官方内核对齐 | `main.js`, `ui/app.js` | 官方 Codex CLI `v0.152.1` 状态检测与 2026 旗舰模型矩阵 |
 | **Seam 15** | Tab Queueing | `src/components/Composer/`, `hooks/useTabQueue.ts` | 异步非阻塞指令排队、UI 状态指示条与流水线调度 |
 | **Seam 16** | Slash Commands | `src/components/Composer/`, `ui/app.js` | 原生 `/status`, `/diff`, `/skills`, `/clear`, `/help` 指令调度 |
 | **Seam 17** | 主进程权威安全沙箱 | `main.js`, `tests/workspace-security.test.mjs` | 路径穿透/软链接逃逸防御、二进制嗅探拦截、三级权限模式与物理 `.bak` 备份 |
-| **Seam 18** | 流式中断与撤回状态机 | `main.js`, `src/App.tsx`, `src/hooks/useSessions.ts` | 物理掐断活跃 HTTP 连接、成对抹去问答轮次并一键回填 Prompt 修改重发 |
+| **Seam 18** | 深度交互与编辑状态机 | `main.js`, `src/App.tsx`, `src/components/Composer/`, `src/utils/mention.ts` | 物理掐断活跃 HTTP 连接、成对撤回问答并回填、@ 文件引用原子化整体删除与智能空格清理 |
 
 ---
 

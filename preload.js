@@ -225,6 +225,14 @@ contextBridge.exposeInMainWorld("codexDesktop", {
   },
   onUpdateDownloaded: (callback) => {
     ipcRenderer.on("update-downloaded", (_event, data) => callback(data));
+  },
+  applyUpdateNow: () => ipcRenderer.invoke("apply-update-now"),
+  applyUpdateOnQuit: () => ipcRenderer.invoke("apply-update-on-quit"),
+  onUpdatePendingOnQuit: (callback) => {
+    ipcRenderer.on("update-pending-on-quit", (_event, data) => callback(data));
+  },
+  onUpdateError: (callback) => {
+    ipcRenderer.on("update-error", (_event, data) => callback(data));
   }
 });
 

@@ -291,7 +291,10 @@ export const App: React.FC = () => {
     progress: updateProgress,
     isDownloaded: isUpdateDownloaded,
     downloadedVersion,
+    errorMessage: updateErrorMessage,
     startDownload,
+    installNow,
+    installOnQuit,
     closeModal: closeUpdateModal,
     checkForUpdates,
   } = useUpdater();
@@ -1420,7 +1423,14 @@ export const App: React.FC = () => {
           onMoveSessionToWorkspace={moveSessionToWorkspace}
           onDeleteSession={deleteSession}
           onRenameSession={renameSession}
-          onInsertPrompt={(text) => setInputPrompt(prev => prev ? `${prev} ${text}` : text)}
+          onInsertPrompt={(text) => {
+            const formatted = text.endsWith(' ') ? text : `${text} `;
+            setInputPrompt(prev => {
+              if (!prev) return formatted;
+              if (prev.endsWith(' ')) return `${prev}${formatted}`;
+              return `${prev} ${formatted}`;
+            });
+          }}
           onSelectFile={handleSelectFile}
           onOpenSettings={() => setIsSettingsOpen(true)}
           onOpenTheme={() => setIsThemeOpen(true)}
@@ -1545,7 +1555,14 @@ export const App: React.FC = () => {
           originalContent={previewFile?.originalContent}
           hasBackup={previewFile?.hasBackup}
           onRevert={handleRevertFile}
-          onInsertToPrompt={(text) => setInputPrompt(prev => prev ? `${prev} ${text}` : text)}
+          onInsertToPrompt={(text) => {
+            const formatted = text.endsWith(' ') ? text : `${text} `;
+            setInputPrompt(prev => {
+              if (!prev) return formatted;
+              if (prev.endsWith(' ')) return `${prev}${formatted}`;
+              return `${prev} ${formatted}`;
+            });
+          }}
         />
       </div>
 
@@ -1594,7 +1611,10 @@ export const App: React.FC = () => {
         progress={updateProgress}
         isDownloaded={isUpdateDownloaded}
         downloadedVersion={downloadedVersion}
+        errorMessage={updateErrorMessage}
         onStartDownload={startDownload}
+        onInstallNow={installNow}
+        onInstallOnQuit={installOnQuit}
       />
 
       <ImageLightbox

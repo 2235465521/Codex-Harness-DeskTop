@@ -270,7 +270,10 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
               </span>
               <button
                 type="button"
-                onClick={() => onInsertToPrompt(`@${filePath}`)}
+                onClick={() => {
+                  const fileRef = filePath.includes(' ') ? `@"${filePath}"` : `@${filePath}`;
+                  onInsertToPrompt(`${fileRef} `);
+                }}
                 className="flex items-center gap-1 text-[10px] text-accent hover:underline cursor-pointer shrink-0"
                 title="在当前输入框中引用该文件"
               >

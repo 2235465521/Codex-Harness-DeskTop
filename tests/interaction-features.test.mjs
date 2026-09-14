@@ -6,14 +6,14 @@ import vm from 'node:vm';
 /**
  * Seam 18: 主动打断流式生成与消息撤回修改状态机 TDD 测试套件
  */
-export function runInteractionFeaturesTests() {
+export async function runInteractionFeaturesTests() {
   process.stdout.write("\n═══ Seam 18: 主动打断流式生成与消息撤回修改状态机 ═══\n");
 
   const rootDir = process.cwd();
 
-  function test(name, fn) {
+  async function test(name, fn) {
     try {
-      fn();
+      await fn();
       process.stdout.write(`  ✅ [PASS] ${name}\n`);
     } catch (err) {
       process.stdout.write(`  ❌ [FAIL] ${name}\n`);
@@ -169,6 +169,71 @@ export function runInteractionFeaturesTests() {
     assert.ok(composer.includes(".pdf"), "文件选择器必须接受 .pdf");
     assert.ok(app.includes("docx|pdf"), "@ 挂载 PDF 时必须标明已抽取正文");
     assert.ok(!/ext === '\.pdf'/.test(composer), "PDF 不得再被当成无法读取的办公格式拒绝");
+  });
+
+  test("@ 引用原子化删除状态机: Backspace / Delete 整体删除与智能空格清理", async () => {
+    const composerTsx = fs.readFileSync(path.join(rootDir, "src", "components", "Composer", "Composer.tsx"), "utf8");
+    const appJs = fs.readFileSync(path.join(rootDir, "ui", "app.js"), "utf8");
+    const mentionTs = fs.readFileSync(path.join(rootDir, "src", "utils", "mention.ts"), "utf8");
+
+    assert.ok(composerTsx.includes("handleAtMentionDeletion"), "Composer 必须引入 handleAtMentionDeletion");
+    assert.ok(composerTsx.includes("Backspace"), "Composer 必须拦截 Backspace 键");
+    assert.ok(composerTsx.includes("Delete"), "Composer 必须拦截 Delete 键");
+    assert.ok(appJs.includes("handleAtMentionDeletion"), "ui/app.js 必须实现 handleAtMentionDeletion");
+    assert.ok(mentionTs.includes("getAtMentionTokens"), "mention.ts 必须导出 getAtMentionTokens");
+
+    // 从 ui/app.js 抽取纯 JS 逻辑并在沙箱中执行完整断言 (消除 typeless 警告)
+    const start = appJs.indexOf("const AT_FILE_EXTS =");
+    const end = appJs.indexOf("if (btnSend)");
+    assert.ok(start >= 0 && end > start, "必须能提取 @ mention 解析状态机");
+    const ctx = { console, RegExp };
+    vm.createContext(ctx);
+    vm.runInContext(appJs.slice(start, end), ctx);
+    const { getAtMentionTokens, handleAtMentionDeletion } = ctx;
+
+    // 测试 1: 中文长路径退格整体删除
+    const text1 = "@电商监督/面向智能监管的直播电商组合型违规识别_多模态大模型评测与证据增强.docx ";
+    const res1 = handleAtMentionDeletion(text1, text1.length, 'Backspace');
+    assert.ok(res1, "命中 @ 文件删除");
+    assert.strictEqual(res1.newText, "", "末尾退格应完全清除该引用及尾部空格");
+    assert.strictEqual(res1.newCursorPos, 0, "光标位置归零");
+
+    // 测试 2: 中文长路径无尾部空格退格
+    const text2 = "@电商监督/面向智能监管的直播电商组合型违规识别_多模态大模型评测与证据增强.docx";
+    const res2 = handleAtMentionDeletion(text2, text2.length, 'Backspace');
+    assert.ok(res2);
+    assert.strictEqual(res2.newText, "");
+
+    // 测试 3: 句子内部引用删除与空格保留
+    const text3 = "请分析 @电商监督/xxx.docx 其中的违规项";
+    const tokens3 = getAtMentionTokens(text3);
+    assert.strictEqual(tokens3.length, 1);
+    const res3 = handleAtMentionDeletion(text3, tokens3[0].end + 1, 'Backspace');
+    assert.ok(res3);
+    assert.strictEqual(res3.newText, "请分析 其中的违规项", "删除后句子间应保留合理单个空格");
+    assert.strictEqual(res3.newCursorPos, 4);
+
+    // 测试 4: 标点符号前无尾部空格时的前置空格清理
+    const text4 = "请看 @file.docx，谢谢";
+    const tokens4 = getAtMentionTokens(text4);
+    const res4 = handleAtMentionDeletion(text4, tokens4[0].end, 'Backspace');
+    assert.strictEqual(res4.newText, "请看，谢谢", "标点符号前应智能清理无用空格");
+
+    // 测试 5: Delete 键在 @ 前方整体删除
+    const text5 = "请看 @file.docx 谢谢";
+    const tokens5 = getAtMentionTokens(text5);
+    const res5 = handleAtMentionDeletion(text5, tokens5[0].start, 'Delete');
+    assert.strictEqual(res5.newText, "请看 谢谢");
+
+    // 测试 6: 引号路径整体删除
+    const text6 = '@"电商监督/直播 违规.docx" ';
+    const res6 = handleAtMentionDeletion(text6, text6.length, 'Backspace');
+    assert.strictEqual(res6.newText, "");
+
+    // 测试 7: 邮箱地址防误触
+    const email = "user@example.com";
+    const resEmail = handleAtMentionDeletion(email, email.length, 'Backspace');
+    assert.strictEqual(resEmail, null, "邮箱地址严禁被误判为 @ 引用");
   });
 }
 

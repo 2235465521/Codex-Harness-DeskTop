@@ -261,8 +261,11 @@ export interface CodexDesktopAPI {
   onUpdateAvailable: (callback: (info: UpdateInfo) => void) => void;
   onUpdateDownloading: (callback: () => void) => void;
   onUpdateProgress: (callback: (progress: UpdateProgress) => void) => void;
-  onUpdateDownloaded: (callback: (res: { version: string; filePath: string }) => void) => void;
-  onUpdateError: (callback: (err: { message: string }) => void) => void;
+  onUpdateDownloaded: (callback: (res: { version: string; filePath?: string; installerPath?: string }) => void) => void;
+  onUpdateError: (callback: (err: { message?: string; error?: string }) => void) => void;
+  applyUpdateNow?: () => Promise<{ success: boolean }>;
+  applyUpdateOnQuit?: () => Promise<{ success: boolean; pending: boolean }>;
+  onUpdatePendingOnQuit?: (callback: (data: { version: string }) => void) => void;
 }
 
 declare global {
