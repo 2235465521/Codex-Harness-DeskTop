@@ -232,7 +232,7 @@ function isAllowedUpdateDownloadUrl(downloadUrl) {
   const host = u.hostname.toLowerCase();
   const pathname = u.pathname || "";
   if (host === "github.com") {
-    return /^\/Simon-yyy\/Codex-Harness-DeskTop\/releases\//i.test(pathname);
+    return /^\/(?:Simon-yyy|2235465521)\/Codex-Harness-DeskTop\/releases\//i.test(pathname);
   }
   // GitHub Release 资产 CDN（browser_download_url 常跳转到此）
   if (
@@ -656,7 +656,7 @@ function createWindow() {
 function downloadFile(url, destPath, onProgress) {
   return new Promise((resolve, reject) => {
     const candidateUrls = [url];
-    if (url.includes("github.com/Simon-yyy/Codex-Harness-DeskTop/releases/download/")) {
+    if (url.includes("/Codex-Harness-DeskTop/releases/download/")) {
       candidateUrls.push(`https://ghfast.top/${url}`);
       candidateUrls.push(`https://mirror.ghproxy.com/${url}`);
     }
@@ -778,94 +778,123 @@ function checkForUpdates(isSilent = false) {
     return;
   }
 
-  const options = {
-    hostname: "api.github.com",
-    path: "/repos/Simon-yyy/Codex-Harness-DeskTop/releases/latest",
-    headers: { "User-Agent": "cline/3.0.0" }
-  };
+  const repoCandidates = [
+    "/repos/2235465521/Codex-Harness-DeskTop/releases/latest",
+    "/repos/Simon-yyy/Codex-Harness-DeskTop/releases/latest"
+  ];
 
-  https.get(options, (res) => {
-    let body = "";
-    res.on("data", (d) => body += d);
-    res.on("end", () => {
-      try {
-        if (res.statusCode !== 200) {
-          if (!isSilent) {
-            let tip = `无法连接或未找到远程发布版本 (HTTP ${res.statusCode})。\n当前本地版本: v${app.getVersion()}`;
-            if (res.statusCode === 403) {
-              tip = `GitHub API 访问频次受限 (HTTP 403)。\n请稍后再试，或直接通过【关于】页面的 GitHub 仓库链接获取最新版本！\n当前本地版本: v${app.getVersion()}`;
+  function queryRepo(index = 0) {
+    if (index >= repoCandidates.length) {
+      if (!isSilent) {
+        dialog.showMessageBox(mainWindow || null, {
+          type: "info",
+          title: "检查更新",
+          message: `未找到远程发布版本。\n当前本地版本: v${app.getVersion()}`,
+          buttons: ["确定"]
+        });
+      }
+      return;
+    }
+
+    const currentPath = repoCandidates[index];
+    const options = {
+      hostname: "api.github.com",
+      path: currentPath,
+      headers: { "User-Agent": "cline/3.0.0" }
+    };
+
+    https.get(options, (res) => {
+      let body = "";
+      res.on("data", (d) => body += d);
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) {
+            // 若首选仓库尚无 release，无感切换至主干仓库
+            if (index + 1 < repoCandidates.length) {
+              return queryRepo(index + 1);
             }
+            if (!isSilent) {
+              let tip = `无法连接或未找到远程发布版本 (HTTP ${res.statusCode})。\n当前本地版本: v${app.getVersion()}`;
+              if (res.statusCode === 403) {
+                tip = `GitHub API 访问频次受限 (HTTP 403)。\n请稍后再试，或直接通过【关于】页面的 GitHub 仓库链接获取最新版本！\n当前本地版本: v${app.getVersion()}`;
+              }
+              dialog.showMessageBox(mainWindow || null, {
+                type: "info",
+                title: "检查更新",
+                message: tip,
+                buttons: ["确定"]
+              });
+            }
+            return;
+          }
+
+          const data = JSON.parse(body);
+          const latestTag = (data.tag_name || "").replace(/^v/, "");
+          const currentVer = app.getVersion();
+
+          if (latestTag && isNewerVersion(latestTag, currentVer)) {
+            const exeAsset = (data.assets || []).find((a) => a.name && a.name.endsWith(".exe"));
+            const downloadUrl = exeAsset ? exeAsset.browser_download_url : "";
+
+            // 向渲染进程广播更新就绪事件
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send("update-available", {
+                currentVersion: currentVer,
+                latestVersion: latestTag,
+                body: data.body || "常规性能提升与体验优化。",
+                downloadUrl: downloadUrl
+              });
+            }
+
+            // 如果是用户主动手动点击检查更新，弹出对话框
+            if (!isSilent) {
+              dialog.showMessageBox(mainWindow || null, {
+                type: "info",
+                title: "🎉 发现全新版本",
+                message: `发现 Codex Desktop 全新版本 v${latestTag}（当前版本: v${currentVer}）！\n\n更新说明：\n${data.body || "常规性能提升与体验优化。"}`,
+                buttons: ["⚡ 立即在应用内下载升级", "稍后再说"],
+                defaultId: 0
+              }).then(({ response }) => {
+                if (response === 0 && downloadUrl) {
+                  startDownloadUpdate(downloadUrl, latestTag);
+                }
+              });
+            }
+          } else if (!isSilent) {
             dialog.showMessageBox(mainWindow || null, {
               type: "info",
               title: "检查更新",
-              message: tip,
+              message: `当前已是最新版本 (v${currentVer})，无需更新。`,
               buttons: ["确定"]
             });
           }
-          return;
-        }
-
-        const data = JSON.parse(body);
-        const latestTag = (data.tag_name || "").replace(/^v/, "");
-        const currentVer = app.getVersion();
-
-        if (latestTag && isNewerVersion(latestTag, currentVer)) {
-          const exeAsset = (data.assets || []).find((a) => a.name && a.name.endsWith(".exe"));
-          const downloadUrl = exeAsset ? exeAsset.browser_download_url : "";
-
-          // 向渲染进程广播更新就绪事件
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send("update-available", {
-              currentVersion: currentVer,
-              latestVersion: latestTag,
-              body: data.body || "常规性能提升与体验优化。",
-              downloadUrl: downloadUrl
-            });
-          }
-
-          // 如果是用户主动手动点击检查更新，弹出对话框
+        } catch (err) {
           if (!isSilent) {
             dialog.showMessageBox(mainWindow || null, {
-              type: "info",
-              title: "🎉 发现全新版本",
-              message: `发现 Codex Desktop 全新版本 v${latestTag}（当前版本: v${currentVer}）！\n\n更新说明：\n${data.body || "常规性能提升与体验优化。"}`,
-              buttons: ["⚡ 立即在应用内下载升级", "稍后再说"],
-              defaultId: 0
-            }).then(({ response }) => {
-              if (response === 0 && downloadUrl) {
-                startDownloadUpdate(downloadUrl, latestTag);
-              }
+              type: "error",
+              title: "检查更新失败",
+              message: `解析更新数据异常: ${err.message}`,
+              buttons: ["确定"]
             });
           }
-        } else if (!isSilent) {
-          dialog.showMessageBox(mainWindow || null, {
-            type: "info",
-            title: "检查更新",
-            message: `当前已是最新版本 (v${currentVer})，无需更新。`,
-            buttons: ["确定"]
-          });
         }
-      } catch (err) {
-        if (!isSilent) {
-          dialog.showMessageBox(mainWindow || null, {
-            type: "error",
-            title: "检查更新失败",
-            message: `解析更新数据异常: ${err.message}`,
-            buttons: ["确定"]
-          });
-        }
+      });
+    }).on("error", (err) => {
+      if (index + 1 < repoCandidates.length) {
+        return queryRepo(index + 1);
+      }
+      if (!isSilent) {
+        dialog.showMessageBox(mainWindow || null, {
+          type: "error",
+          title: "网络异常",
+          message: `无法连接更新服务器: ${err.message}`,
+          buttons: ["确定"]
+        });
       }
     });
-  }).on("error", (err) => {
-    if (!isSilent) {
-      dialog.showMessageBox(mainWindow || null, {
-        type: "error",
-        title: "网络异常",
-        message: `无法连接更新服务器: ${err.message}`,
-        buttons: ["确定"]
-      });
-    }
-  });
+  }
+
+  queryRepo(0);
 }
 
 function applyPendingUpdate() {
