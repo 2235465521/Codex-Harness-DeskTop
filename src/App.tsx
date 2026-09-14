@@ -83,6 +83,46 @@ const WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC = {
   input_schema: WRITE_WORKSPACE_FILE_TOOL_OPENAI.function.parameters,
 };
 
+/** OpenAI / Anthropic 共用的工作区读文件工具。只读路径，复用已有 readWorkspaceFile。 */
+const READ_WORKSPACE_FILE_TOOL_OPENAI = {
+  type: 'function' as const,
+  function: {
+    name: 'read_workspace_file',
+    description:
+      '读取当前工作区中尚未出现在本轮上下文里的一个文件。relativePath 必须是相对工作区根目录的路径。返回文本正文；.docx 与文字型 PDF 会抽取正文。二进制、.xlsx/.xls/.doc/.pptx，以及无文字层的扫描 PDF 会失败。超限会截断并注明，不是全文。用户已用 @ 挂载的同一路径不必重复读取。',
+    parameters: {
+      type: 'object',
+      properties: {
+        relativePath: {
+          type: 'string',
+          description: '相对工作区根目录的路径，如 src/App.tsx 或 docs/report.md',
+        },
+      },
+      required: ['relativePath'],
+    },
+  },
+};
+
+const READ_WORKSPACE_FILE_TOOL_ANTHROPIC = {
+  name: 'read_workspace_file',
+  description: READ_WORKSPACE_FILE_TOOL_OPENAI.function.description,
+  input_schema: READ_WORKSPACE_FILE_TOOL_OPENAI.function.parameters,
+};
+
+function localWorkspaceToolsOpenAI(canRead: boolean, canWrite: boolean) {
+  return [
+    ...(canRead ? [READ_WORKSPACE_FILE_TOOL_OPENAI] : []),
+    ...(canWrite ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+  ];
+}
+
+function localWorkspaceToolsAnthropic(canRead: boolean, canWrite: boolean) {
+  return [
+    ...(canRead ? [READ_WORKSPACE_FILE_TOOL_ANTHROPIC] : []),
+    ...(canWrite ? [WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC] : []),
+  ];
+}
+
 type CodexToolCall = { id?: string; name: string; arguments: string };
 
 /** 解析标记块兜底：@@@write_file path="a.md"\\n...@@@end */
@@ -170,11 +210,86 @@ async function executeWriteWorkspaceTools(
   return { lines, results };
 }
 
-/** 写盘 / MCP 工具多轮上限（首轮 + 续轮，对齐连接器规格默认 5） */
+async function executeReadWorkspaceTools(
+  toolCalls: CodexToolCall[]
+): Promise<{ lines: string[]; results: { id: string; name: string; content: string }[] }> {
+  const lines: string[] = [];
+  const results: { id: string; name: string; content: string }[] = [];
+  for (let i = 0; i < toolCalls.length; i++) {
+    const tc = toolCalls[i];
+    const callId = tc.id || `call_${i}_${Date.now()}`;
+    if (tc.name !== 'read_workspace_file') {
+      const msg = `⏭ 忽略未知工具 \`${tc.name}\``;
+      lines.push(`- ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    let args: { relativePath?: string } = {};
+    try {
+      args = JSON.parse(tc.arguments || '{}');
+    } catch {
+      const msg = 'read_workspace_file 参数 JSON 解析失败';
+      lines.push(`- ❌ ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    const relativePath = String(args.relativePath || '').trim();
+    if (!relativePath) {
+      const msg = 'read_workspace_file 缺少 relativePath';
+      lines.push(`- ❌ ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    const blockedOffice = indirectOfficeHint(relativePath);
+    if (blockedOffice) {
+      lines.push(`- ❌ 读取失败 \`${relativePath}\`: 该格式不能直接读取`);
+      results.push({ id: callId, name: tc.name, content: blockedOffice });
+      continue;
+    }
+    if (!window.codexDesktop?.readWorkspaceFile) {
+      const msg = '当前环境不支持读文件';
+      lines.push(`- ❌ ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    try {
+      const res = await window.codexDesktop.readWorkspaceFile(relativePath);
+      if (res?.ok) {
+        const body = typeof res.content === 'string' ? res.content : '';
+        const text = body.length > 0 ? body : `【空文件】${relativePath} 存在，但没有可读正文。`;
+        const truncatedNote =
+          res.isTruncated && !text.includes('已截取') && !text.includes('仅截取')
+            ? '\n\n[部分内容：本次不是全文，剩余部分已略去]'
+            : '';
+        lines.push(`- ✅ 已读取 \`${relativePath}\`${res.isTruncated ? '（已截断）' : ''}`);
+        results.push({ id: callId, name: tc.name, content: text + truncatedNote });
+      } else {
+        const err = res?.reason || res?.code || '读取失败';
+        lines.push(`- ❌ 读取失败 \`${relativePath}\`: ${err}`);
+        results.push({
+          id: callId,
+          name: tc.name,
+          content: JSON.stringify({ ok: false, relativePath, error: err, hint: res?.hint || '' }),
+        });
+      }
+    } catch (e: any) {
+      const err = e?.message || String(e);
+      lines.push(`- ❌ 读取异常 \`${relativePath}\`: ${err}`);
+      results.push({
+        id: callId,
+        name: tc.name,
+        content: JSON.stringify({ ok: false, relativePath, error: err }),
+      });
+    }
+  }
+  return { lines, results };
+}
+
+/** 读盘 / 写盘 / MCP 工具多轮上限（首轮 + 续轮，对齐连接器规格默认 5） */
 const MAX_WRITE_TOOL_ROUNDS = 5;
 
 function isAgentToolName(name: string) {
-  return name === 'write_workspace_file' || name.startsWith('mcp__');
+  return name === 'read_workspace_file' || name === 'write_workspace_file' || name.startsWith('mcp__');
 }
 
 function connectorToolsToOpenAI(tools: ConnectorToolInfo[]) {
@@ -210,6 +325,13 @@ async function executeAgentTools(
   for (let i = 0; i < toolCalls.length; i++) {
     const tc = toolCalls[i];
     const callId = tc.id || `call_${i}_${Date.now()}`;
+
+    if (tc.name === 'read_workspace_file') {
+      const one = await executeReadWorkspaceTools([{ ...tc, id: callId }]);
+      lines.push(...one.lines);
+      results.push(...one.results);
+      continue;
+    }
 
     if (tc.name === 'write_workspace_file') {
       const one = await executeWriteWorkspaceTools([{ ...tc, id: callId }], onFileWritten);
@@ -715,7 +837,7 @@ export const App: React.FC = () => {
               walk(treeRes.tree);
               treeOutline = nodes.join('\n');
               if (treeRes.totalCount && treeRes.totalCount > 120) {
-                treeOutline += `\n... [工程规模较大，共计 ${treeRes.totalCount} 项，已略去后续条目，可输入具体文件名或使用 @ 引用]`;
+                treeOutline += `\n... [工程规模较大，共计 ${treeRes.totalCount} 项，已略去后续条目，可调用 read_workspace_file 读取具体文件，或使用 @ 引用]`;
               }
             }
           } catch (e) {
@@ -725,19 +847,20 @@ export const App: React.FC = () => {
 
         let modeTitle = '📖 工作区只读模式 (Workspace Read-Only)';
         let modeRule =
-          '你当前处于工作区只读安全沙箱。请基于下方已提供的工作区大纲和上下文挂载文件，立即直接给出完整分析、代码诊断或推演方案；严禁输出“让我读取核心文件...”等中断性语句。\n' +
+          '你当前处于工作区只读安全沙箱。工作区大纲只供定位路径，不是文件正文。需要查看文件时调用工具 `read_workspace_file`（参数 relativePath，相对工作区根目录），结果会回到本轮对话。禁止声称“无法读取文件”，也禁止只输出“让我读取...”后结束而不调用工具。用户本轮已用 @ 挂载的文件已在消息中，不必再读同一路径。\n' +
           '【工具边界】禁止调用 `write_workspace_file` 及任何本地写盘标记（filepath / @@@write_file）。若会话已挂载 MCP 连接器工具（名称以 `mcp__` 开头），仅可用于远程只读检索/查询，不得据此改写本地工程文件。';
         if (permissionMode === 'workspace-readwrite') {
           modeTitle = '✍️ 工作区读写模式 (Workspace Read/Write - 自动修改工程落盘)';
           modeRule = '【核心直写架构认知】你正运行在 Codex Desktop 工业级桌面端中，当前环境已直接授权你修改本地工程文件！客户端内置代码与文档自动落盘引擎，只要你在代码块第一行清晰标注 `// filepath: <相对路径>`（如 `// filepath: src/App.tsx`、`# filepath: config.py`、或 Markdown 文档 `<!-- filepath: docs/架构报告.md -->`），客户端在生成结束时将全自动直接修改并写入本地物理磁盘，并联动刷新左侧文件树与抽屉。\n' +
             '【输出纯粹性规约】客户端界面已自动为带 filepath 的代码块呈现完整的目标文件名与落盘状态，绝对严禁在代码块外部输出“已写入工作区xxx”、“若工作区没有请手动保存为同名文件”等自我推诿的套话和废话！直接输出分析正文和带 filepath 的代码块即可。\n' +
             '【文档与长文本产出规约】当用户要求生成文档、审查报告、设计方案、测试用例或 PRD 等长篇交付物时，必须将完整正文放入**同一个**带 filepath 的 Markdown 代码块（如 ````markdown\n<!-- filepath: docs/REPORT.md -->\n# 全文...\n````）；对话区仅保留 2~3 句摘要。严禁拆成「第1部分/第2部分」、多个不同路径或半截后说“未完待续”。若单次输出长度不够，后续续写必须复用**完全相同**的 filepath，客户端会自动拼接为同一文件。\n' +
+            '【工具读盘】需要查看尚未挂载的文件时，先调用 `read_workspace_file`（参数 relativePath）。用户本轮已用 @ 挂载的同一路径不必重复读取。超限会截断并注明，截断提示表示这不是全文。\n' +
             '【工具写盘（推荐）】你可以使用工具 `write_workspace_file`（参数 relativePath + content）直接写入工作区完整文件；也可使用标记块：\n@@@write_file path="docs/a.md"\n全文\n@@@end\n优先工具/标记写完整文件，比多个残缺代码块更可靠。\n' +
             '【工程目录洁癖规约】严禁在工程根目录下随地创建临时测试或排查脚本！生成的诊断或排查脚本必须收纳在 `scripts/` 目录下（如 `scripts/diagnose-target.ps1`），技术文档必须收纳在 `docs/` 目录下，严禁污染工程根目录。\n' +
             '【绝对红线规约】绝对严禁向用户声称“我无法直接写文件”、“没有直接往磁盘写文件的通道”或“落盘必须你手动操作”，绝对严禁要求用户手动复制粘贴或保存文件！直接输出带 filepath 的完整内容即可，输出即代表直接落地！';
         } else if (permissionMode === 'full-access') {
           modeTitle = '🌐 全局受信任模式 (Full Access)';
-          modeRule = '你拥有全局代码与文档直接修改落盘权限。优先调用工具 write_workspace_file，或使用 @@@write_file 标记，或带 filepath 的代码块。长篇文档必须使用同一路径；禁止拆成多个残缺文件。临时脚本收纳在 scripts/，文档收纳在 docs/。严禁输出“若未落盘请手动保存”等推诿废话。';
+          modeRule = '你拥有全局代码与文档直接修改落盘权限。查看尚未挂载的文件时先调用 read_workspace_file（参数 relativePath）；用户本轮已用 @ 挂载的同一路径不必重复读取。优先调用工具 write_workspace_file，或使用 @@@write_file 标记，或带 filepath 的代码块。长篇文档必须使用同一路径；禁止拆成多个残缺文件。临时脚本收纳在 scripts/，文档收纳在 docs/。严禁输出“若未落盘请手动保存”等推诿废话。';
         }
 
         workspaceSystemPrompt = `【当前工作区工程环境与安全运行权限】\n` +
@@ -924,6 +1047,7 @@ export const App: React.FC = () => {
 
       const canUseWriteTools =
         permissionMode === 'workspace-readwrite' || permissionMode === 'full-access';
+      const canUseReadTools = permissionMode !== 'chat-only';
 
       let mcpToolsOpenAI: ReturnType<typeof connectorToolsToOpenAI> = [];
       let mcpToolsAnthropic: ReturnType<typeof connectorToolsToAnthropic> = [];
@@ -956,7 +1080,7 @@ export const App: React.FC = () => {
           if (!endpoint.endsWith('/messages')) endpoint += '/v1/messages';
           const systemPrompts = contextMessages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
           const aTools = [
-            ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC] : []),
+            ...localWorkspaceToolsAnthropic(canUseReadTools, canUseWriteTools),
             ...mcpToolsAnthropic,
           ];
           body = {
@@ -972,7 +1096,7 @@ export const App: React.FC = () => {
             endpoint += '/v1/chat/completions';
           }
           const oTools = [
-            ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+            ...localWorkspaceToolsOpenAI(canUseReadTools, canUseWriteTools),
             ...mcpToolsOpenAI,
           ];
           body = {
@@ -988,7 +1112,7 @@ export const App: React.FC = () => {
             endpoint += '/chat/completions';
           }
           const oTools = [
-            ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+            ...localWorkspaceToolsOpenAI(canUseReadTools, canUseWriteTools),
             ...mcpToolsOpenAI,
           ];
           body = {
@@ -1058,14 +1182,18 @@ export const App: React.FC = () => {
             }
           }
 
-          // 若流式已输出，保持已有内容；若未收到流式内容，做兜底覆盖
+          // 工具调用常只回 tool_calls、正文为空。此时不要写成鉴权失败，等工具续跑后再显示正文或执行结果。
+          const hasPendingAgentTools = collectedToolCalls.some((t) => isAgentToolName(t.name));
+          const emptyReplyFallback = hasPendingAgentTools
+            ? ''
+            : '⚠️ 未收到模型正文。接口已返回，但这轮没有可显示的文本，不是 API Key 错误。';
           updateLastMessageInCurrentSession(prev => ({
             ...prev,
-            content: prev.content || response?.content || '⚠️ 未收到有效模型回复，请检查 Base URL 与 API Key 是否正确。',
-            thinking: response?.thinking || prev.thinking || '任务思考已完成。'
+            content: prev.content || response?.content || emptyReplyFallback,
+            thinking: response?.thinking || prev.thinking || (hasPendingAgentTools ? '正在执行工具...' : '任务思考已完成。')
           }));
 
-          // Wave D + MCP：执行写盘/连接器工具 + @@@write_file 标记兜底 + 有限多轮续跑
+          // 读盘 / 写盘 / MCP：执行工具 + @@@write_file 标记兜底 + 有限多轮续跑
           {
             const toolResults: string[] = [];
             let lastApiToolCalls = collectedToolCalls.filter((t) => isAgentToolName(t.name));
@@ -1185,7 +1313,7 @@ export const App: React.FC = () => {
                   if (!contEndpoint.endsWith('/messages')) contEndpoint += '/v1/messages';
                   const systemPrompts = roundMessages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
                   const contATools = [
-                    ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC] : []),
+                    ...localWorkspaceToolsAnthropic(canUseReadTools, canUseWriteTools),
                     ...mcpToolsAnthropic,
                   ];
                   contBody = {
@@ -1205,7 +1333,7 @@ export const App: React.FC = () => {
                     contEndpoint += '/chat/completions';
                   }
                   const contOTools = [
-                    ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+                    ...localWorkspaceToolsOpenAI(canUseReadTools, canUseWriteTools),
                     ...mcpToolsOpenAI,
                   ];
                   contBody = {

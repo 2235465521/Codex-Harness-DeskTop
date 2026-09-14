@@ -143,6 +143,22 @@ export function runInteractionFeaturesTests() {
     assert.ok(app.includes("tool_call_id") || app.includes("tool_result"), "续跑须回传 tool 结果");
   });
 
+  test("read_workspace_file 只读模式可调用且纯对话不挂载", () => {
+    const app = fs.readFileSync(path.join(rootDir, "src", "App.tsx"), "utf8");
+    assert.ok(app.includes("READ_WORKSPACE_FILE_TOOL_OPENAI"), "App 必须注册读文件工具");
+    assert.ok(app.includes("executeReadWorkspaceTools"), "App 必须执行读文件工具");
+    assert.ok(app.includes("readWorkspaceFile"), "读工具必须复用已有读文件通道");
+    assert.ok(app.includes("name === 'read_workspace_file'"), "读工具必须进入同一工具循环");
+    assert.ok(app.includes("permissionMode !== 'chat-only'"), "纯对话模式不得挂载读工具");
+    assert.ok(app.includes("localWorkspaceToolsOpenAI(canUseReadTools, canUseWriteTools)"), "首轮与续跑都要挂读工具");
+    assert.ok(app.includes("localWorkspaceToolsAnthropic(canUseReadTools, canUseWriteTools)"), "Anthropic 协议也要挂读工具");
+    assert.ok(!app.includes("让我读取核心文件"), "只读提示不得再禁止读文件");
+    assert.ok(app.includes("调用工具 `read_workspace_file`"), "只读提示必须要求调用读工具");
+    assert.ok(app.includes("禁止调用 `write_workspace_file`"), "只读模式仍须禁止写盘");
+    assert.ok(app.includes("hasPendingAgentTools"), "工具调用且正文为空时不得写成鉴权失败");
+    assert.ok(!app.includes("请检查 Base URL 与 API Key 是否正确"), "空回复不得再归咎于 API Key");
+  });
+
   test("docx 挂载: @ 中文路径与正文抽取", () => {
     const mainJs = fs.readFileSync(path.join(rootDir, "main.js"), "utf8");
     const app = fs.readFileSync(path.join(rootDir, "src", "App.tsx"), "utf8");
