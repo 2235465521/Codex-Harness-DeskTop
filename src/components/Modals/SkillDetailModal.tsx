@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Sparkles, Copy, Check, CornerDownLeft, Play, Bookmark } from 'lucide-react';
+import { X, Sparkles, Copy, Check, CornerDownLeft, Play, Bookmark, Pencil, Trash2 } from 'lucide-react';
 import { getSkillDisplayInfo, SKILL_CATEGORIES } from '@/data/skillsDictionary';
 
 export interface SkillItem {
@@ -7,6 +7,8 @@ export interface SkillItem {
   name: string;
   description: string;
   prompt: string;
+  source?: 'builtin' | 'user';
+  editable?: boolean;
 }
 
 interface SkillDetailModalProps {
@@ -14,6 +16,8 @@ interface SkillDetailModalProps {
   onClose: () => void;
   skill: SkillItem | null;
   onInsertPrompt: (text: string) => void;
+  onEditUserSkill?: (skill: SkillItem) => void;
+  onDeleteUserSkill?: (skill: SkillItem) => void;
 }
 
 export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({
@@ -21,6 +25,8 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({
   onClose,
   skill,
   onInsertPrompt,
+  onEditUserSkill,
+  onDeleteUserSkill,
 }) => {
   const [copied, setCopied] = useState(false);
   const [showRawPrompt, setShowRawPrompt] = useState(false);
@@ -91,6 +97,11 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({
                 <span className="font-mono text-[11px] text-accent font-semibold">
                   /{skill.id}
                 </span>
+                {skill.source === 'user' && (
+                  <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-600 border border-amber-500/30">
+                    我的
+                  </span>
+                )}
                 <span className="text-[10px] text-text-muted truncate">
                   · {skill.name}
                 </span>
@@ -214,10 +225,27 @@ export const SkillDetailModal: React.FC<SkillDetailModalProps> = ({
         </div>
 
         {/* 底部动作条 */}
-        <div className="p-3 border-t border-border bg-bg-sidebar flex items-center justify-between">
-          <span className="text-[10px] text-text-muted">
-            按 ESC 键或点击外部可随时关闭
-          </span>
+        <div className="p-3 border-t border-border bg-bg-sidebar flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            {skill.editable && onEditUserSkill && (
+              <button
+                onClick={() => onEditUserSkill(skill)}
+                className="px-2.5 py-1.5 text-[11px] text-text-secondary hover:text-text-primary hover:bg-bg-hover rounded-lg flex items-center gap-1 cursor-pointer"
+              >
+                <Pencil size={12} />
+                编辑
+              </button>
+            )}
+            {skill.editable && onDeleteUserSkill && (
+              <button
+                onClick={() => onDeleteUserSkill(skill)}
+                className="px-2.5 py-1.5 text-[11px] text-red-400/90 hover:text-red-300 hover:bg-red-500/10 rounded-lg flex items-center gap-1 cursor-pointer"
+              >
+                <Trash2 size={12} />
+                删除
+              </button>
+            )}
+          </div>
           <button
             onClick={onClose}
             className="px-4 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:bg-bg-hover rounded-lg transition-colors cursor-pointer"

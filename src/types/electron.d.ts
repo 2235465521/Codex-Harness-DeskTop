@@ -17,6 +17,30 @@ export interface SkillItem {
   displayName?: string;
   chineseSummary?: string;
   category?: string;
+  source?: 'builtin' | 'user';
+  editable?: boolean;
+}
+
+/** MCP 连接器（渲染层脱敏视图） */
+export interface ConnectorPublic {
+  id: string;
+  name: string;
+  transport: string;
+  url: string;
+  healthUrl?: string;
+  enabled: boolean;
+  authHeaderName?: string;
+  hasApiKey: boolean;
+}
+
+export interface ConnectorToolInfo {
+  connectorId: string;
+  connectorName?: string;
+  name?: string;
+  qualifiedName?: string;
+  description?: string;
+  inputSchema?: any;
+  error?: string;
 }
 
 export interface ProviderConfig {
@@ -135,9 +159,68 @@ export interface WorkspaceTreeResult {
 export interface CodexDesktopAPI {
   getAppInfo: () => Promise<AppInfo>;
   getSkills: () => Promise<SkillItem[]>;
+  importUserSkill?: () => Promise<{ ok: boolean; canceled?: boolean; skill?: SkillItem; error?: string; code?: string }>;
+  saveUserSkill?: (payload: {
+    id: string;
+    name: string;
+    description: string;
+    body: string;
+    overwrite?: boolean;
+  }) => Promise<{ ok: boolean; skill?: SkillItem; error?: string; code?: string }>;
+  deleteUserSkill?: (id: string) => Promise<{ ok: boolean; error?: string; code?: string }>;
+  openUserSkillsDir?: () => Promise<{ ok: boolean; error?: string }>;
+  /** MCP 连接器（HTTP） */
+  listConnectors?: () => Promise<{ ok: boolean; connectors: ConnectorPublic[] }>;
+  saveConnector?: (payload: {
+    id?: string;
+    name?: string;
+    url?: string;
+    healthUrl?: string;
+    enabled?: boolean;
+    apiKey?: string;
+    clearApiKey?: boolean;
+    authHeaderName?: string;
+  }) => Promise<{ ok: boolean; connector?: ConnectorPublic; error?: string; code?: string }>;
+  setConnectorEnabled?: (payload: {
+    id: string;
+    enabled: boolean;
+  }) => Promise<{ ok: boolean; connector?: ConnectorPublic; error?: string; code?: string }>;
+  testConnector?: (payload?: {
+    id?: string;
+  }) => Promise<{
+    ok: boolean;
+    health?: any;
+    toolCount?: number;
+    tools?: { name: string; description: string }[];
+    error?: string;
+    code?: string;
+  }>;
+  listConnectorTools?: () => Promise<{
+    ok: boolean;
+    tools: ConnectorToolInfo[];
+    error?: string;
+  }>;
+  callConnectorTool?: (payload: {
+    connectorId: string;
+    name: string;
+    arguments?: any;
+  }) => Promise<{ ok: boolean; result?: any; error?: string; code?: string }>;
+  /** 消息级导出：md / txt / doc(Word) / pdf */
+  exportChatArtifact?: (payload: {
+    content: string;
+    title?: string;
+    format?: 'md' | 'txt' | 'doc' | 'docx' | 'pdf';
+    defaultName?: string;
+  }) => Promise<{ ok: boolean; canceled?: boolean; filePath?: string; format?: string; error?: string; code?: string; note?: string }>;
   requestLLM: (payload: LLMRequestPayload) => Promise<LLMResponsePayload>;
   callLlmApi?: (payload: { endpoint: string; apiKey?: string; body: any; customHeaders?: Record<string, string>; timeout?: number; stream?: boolean; streamId?: string }) => Promise<{ ok: boolean; status: number; statusText: string; body: string }>;
-  onLlmStreamChunk?: (callback: (data: { streamId?: string; contentDelta?: string; thinkingDelta?: string; isDone?: boolean }) => void) => () => void;
+  onLlmStreamChunk?: (callback: (data: {
+    streamId?: string;
+    contentDelta?: string;
+    thinkingDelta?: string;
+    isDone?: boolean;
+    toolCalls?: { id?: string; name: string; arguments: string }[];
+  }) => void) => () => void;
   abortLlmStream?: (streamId: string) => Promise<{ success: boolean; notFound?: boolean }>;
   selectWorkspaceDir?: () => Promise<string | null>;
   setWorkspaceDir?: (dirPath: string) => Promise<{ ok: boolean; activeWorkspaceDir?: string | null; error?: string }>;
@@ -146,6 +229,20 @@ export interface CodexDesktopAPI {
   getSecurityStatus?: () => Promise<SecurityStatus>;
   setPermissionMode?: (mode: PermissionMode) => Promise<{ ok: boolean; canceled?: boolean; error?: string; permissionMode: PermissionMode }>;
   readWorkspaceFile?: (relativePath: string) => Promise<ReadWorkspaceFileResult>;
+  extractDocxText?: (payload: { base64: string; name?: string }) => Promise<{
+    ok: boolean;
+    text?: string;
+    truncated?: boolean;
+    error?: string;
+    code?: string;
+  }>;
+  extractPdfText?: (payload: { base64: string; name?: string }) => Promise<{
+    ok: boolean;
+    text?: string;
+    truncated?: boolean;
+    error?: string;
+    code?: string;
+  }>;
   writeWorkspaceFile?: (payload: { relativePath: string; content: string; createBackup?: boolean }) => Promise<WriteWorkspaceFileResult>;
   readWorkspaceFileDiff?: (relativePath: string) => Promise<ReadWorkspaceFileDiffResult>;
   revertWorkspaceFile?: (relativePath: string) => Promise<RevertWorkspaceFileResult>;
@@ -153,7 +250,7 @@ export interface CodexDesktopAPI {
   getThemes?: () => any;
   getCurrentTheme?: () => string;
   saveTempImage: (base64Data: string) => Promise<{ success: boolean; path: string; error?: string }>;
-  showItemInFolder: (filePath: string) => void;
+  showItemInFolder?: (filePath: string) => void | Promise<{ ok: boolean }>;
   openExternal: (url: string) => void;
   checkForUpdates: (isSilent?: boolean) => void;
   startDownloadUpdate: (payload: { downloadUrl: string; version: string }) => void;

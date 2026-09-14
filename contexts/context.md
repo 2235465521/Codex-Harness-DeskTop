@@ -10,7 +10,7 @@
 - **Core CLI / Daemon**：底层遵循 OpenAI 官方最新 **Codex CLI (`@openai/codex` v0.152.1)** 规范，支持本地环境探测与命令行能力。
 - **Session (会话)**：独立对话单元，包含多轮历史消息、关联模型配置与专属指令排队队列 (`queuedInstructions`)，支持持久化到 `localStorage`。
 - **Tab Queueing (指令流水线)**：官方前沿交互特性。当 Agent 正处于思考/生成回复期间，用户新输入的指令进入排队队列，当前任务完成后自动顺延触发。
-- **Skills (技能生态)**：43 项预置工程技能（包含 35 项 Matt Pocock 工业级技能 + 8 项 Loop Engineering 循环工程技能），启动时自动增量部署至 `~/.codex/skills/`。
+- **Skills (技能生态)**：43 项预置工程技能（包含 35 项 Matt Pocock 工业级技能 + 8 项 Loop Engineering 循环工程技能），启动时自动增量部署至 `~/.codex/skills/`。用户自定义技能规划见 `contexts/implement-user-skills.md`（权威目录拟为 `~/.codex/user-skills/`，MVP 待执行）。
 - **Provider Presets (提供方预设)**：内置 OpenAI (旗舰 `gpt-5.6-sol`, `gpt-5.4-mini`)、Anthropic (`claude-3-7-sonnet` 混合思考)、DeepSeek (`deepseek-reasoner`) 与本地 Ollama 协议适配。
 - **Themes (主题引擎)**：4 款 VS Code 经典极客美学高对比度配色（`escook Dark`, `Dark Soft`, `Light`, `Light Soft`），支持快捷键与菜单毫秒级热切换。
 - **Workspace Grouping (项目归类与联动)**：对话按真实工程物理目录收纳，切换对话自动联动切换当前全局工作区、主进程环境与代码树，使用 `normalizeFsPath` 保证跨平台一致性。

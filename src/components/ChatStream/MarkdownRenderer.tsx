@@ -11,6 +11,10 @@ interface MarkdownRendererProps {
   onFileWritten?: (filePath: string) => void;
   onPermissionChange?: (mode: string) => void;
   isStreaming?: boolean;
+  /** 打开右侧 Diff/预览（对标 Cursor Apply Review） */
+  onOpenFileDiff?: (filePath: string) => void;
+  /** 从 .bak 还原 */
+  onRevertFile?: (filePath: string) => Promise<void> | void;
 }
 
 // 格式化语言名称显示 (如 powershell -> PowerShell)
@@ -46,6 +50,51 @@ function extractFilePath(code: string): { filePath: string | null; cleanCode: st
   return { filePath: null, cleanCode: code };
 }
 
+/** 解析 fence 头：兼容 Cursor `lang:path` / `lang path` */
+function parseFenceHeader(header: string): { language: string; headerPath: string | null } {
+  const t = (header || '').trim();
+  if (!t) return { language: '', headerPath: null };
+  const colon = t.match(/^([a-zA-Z0-9_+-]*)\s*:\s*(.+)$/);
+  if (colon && colon[2] && /[\\/.\w-]/.test(colon[2]) && /[\\/]/.test(colon[2])) {
+    return {
+      language: colon[1] || '',
+      headerPath: colon[2].trim().replace(/^["']|["']$/g, '').replace(/^[./\\]+/, ''),
+    };
+  }
+  const parts = t.split(/\s+/);
+  if (parts.length >= 2 && /[\\/]/.test(parts[1])) {
+    return {
+      language: parts[0],
+      headerPath: parts.slice(1).join(' ').replace(/^[./\\]+/, ''),
+    };
+  }
+  return { language: parts[0] || '', headerPath: null };
+}
+
+/** 将同 filepath 的多个代码块按出现顺序拼接为完整文件内容（长文分段续写） */
+function mergeFilesByPath(
+  files: { filePath: string; code: string }[]
+): { filePath: string; code: string }[] {
+  const order: string[] = [];
+  const chunks = new Map<string, string[]>();
+  for (const f of files) {
+    const key = f.filePath.replace(/\\/g, '/');
+    if (!chunks.has(key)) {
+      order.push(key);
+      chunks.set(key, []);
+    }
+    const part = String(f.code || '').replace(/^\uFEFF/, '');
+    if (part.length) chunks.get(key)!.push(part);
+  }
+  return order.map((filePath) => {
+    const parts = chunks.get(filePath) || [];
+    return {
+      filePath,
+      code: parts.length <= 1 ? (parts[0] || '') : parts.join('\n\n'),
+    };
+  });
+}
+
 // 纯净极简代码块组件 (对齐 Cursor/VS Code 工业标准：文件名标签、极简微标状态与复制)
 const CodeBlock: React.FC<{
   language: string;
@@ -54,9 +103,23 @@ const CodeBlock: React.FC<{
   onApplySingle?: (filePath: string, content: string) => Promise<void>;
   isApplied?: boolean;
   isWritableMode?: boolean;
-}> = ({ language, code, targetFilePath, onApplySingle, isApplied, isWritableMode }) => {
+  onOpenFileDiff?: (filePath: string) => void;
+  onRevertFile?: (filePath: string) => Promise<void> | void;
+  onReverted?: (filePath: string) => void;
+}> = ({
+  language,
+  code,
+  targetFilePath,
+  onApplySingle,
+  isApplied,
+  isWritableMode,
+  onOpenFileDiff,
+  onRevertFile,
+  onReverted,
+}) => {
   const [copied, setCopied] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isReverting, setIsReverting] = useState(false);
 
   const handleCopy = () => {
     navigator.clipboard.writeText(code);
@@ -74,10 +137,23 @@ const CodeBlock: React.FC<{
     }
   };
 
+  const handleRevert = async () => {
+    if (!targetFilePath || !onRevertFile) return;
+    const ok = window.confirm(`确定将「${targetFilePath}」还原为写入前的备份吗？`);
+    if (!ok) return;
+    setIsReverting(true);
+    try {
+      await onRevertFile(targetFilePath);
+      onReverted?.(targetFilePath);
+    } finally {
+      setIsReverting(false);
+    }
+  };
+
   return (
     <div className="my-3 rounded-xl overflow-hidden border border-border/70 bg-[var(--code-bg,#1c1c1d)] shadow-2xs transition-all">
       {/* 顶部信息栏与快速写盘操作 */}
-      <div className="flex items-center justify-between px-3.5 py-1.5 bg-bg-sidebar/50 border-b border-border/40 text-[11px] select-none">
+      <div className="flex items-center justify-between px-3.5 py-1.5 bg-bg-sidebar/50 border-b border-border/40 text-[11px] select-none gap-2">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-mono text-[11px] text-text-muted/80">{formatLang(language)}</span>
           {targetFilePath && (
@@ -91,32 +167,62 @@ const CodeBlock: React.FC<{
           )}
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          {/* 单文件落盘微标或轻量写入按钮 */}
+        <div className="flex items-center gap-1.5 shrink-0">
           {targetFilePath && onApplySingle && (
             isApplied ? (
-              <span
-                className="flex items-center gap-1 font-mono text-[10.5px] text-emerald-500 dark:text-emerald-400 font-medium px-1.5 py-0.5"
-                title="已安全落盘到工作区 (.bak 已自动备份)"
-              >
-                <CheckCheck size={12} className="text-emerald-500 dark:text-emerald-400" />
-                <span>已写入</span>
-              </span>
+              <>
+                <span
+                  className="flex items-center gap-1 font-mono text-[10.5px] text-emerald-500 dark:text-emerald-400 font-medium px-1.5 py-0.5"
+                  title="已安全落盘到工作区 (.bak 已自动备份)"
+                >
+                  <CheckCheck size={12} />
+                  <span>已写入</span>
+                </span>
+                {onOpenFileDiff && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenFileDiff(targetFilePath)}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-text-secondary hover:text-accent hover:bg-accent/10 cursor-pointer"
+                    title="查看 Diff / 预览"
+                  >
+                    Diff
+                  </button>
+                )}
+                {onRevertFile && (
+                  <button
+                    type="button"
+                    onClick={handleRevert}
+                    disabled={isReverting}
+                    className="px-1.5 py-0.5 rounded text-[10px] text-text-secondary hover:text-rose-400 hover:bg-rose-500/10 cursor-pointer disabled:opacity-50"
+                    title="还原为写入前备份"
+                  >
+                    {isReverting ? '…' : '还原'}
+                  </button>
+                )}
+              </>
             ) : isWritableMode ? (
               <button
                 type="button"
                 onClick={handleSave}
                 disabled={isSaving}
                 className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer border bg-accent/15 hover:bg-accent text-accent hover:text-white border-accent/30"
-                title={`一键写入本地: ${targetFilePath}`}
+                title={`Apply 写入: ${targetFilePath}`}
               >
                 {isSaving ? <Loader2 size={11} className="animate-spin" /> : <FileDown size={11} />}
-                <span>{isSaving ? '写入中...' : '写入'}</span>
+                <span>{isSaving ? '写入中...' : 'Apply'}</span>
               </button>
-            ) : null
+            ) : (
+              <button
+                type="button"
+                onClick={() => onApplySingle(targetFilePath, code)}
+                className="px-2 py-0.5 rounded text-[10px] text-amber-500/90 border border-amber-500/30 hover:bg-amber-500/10 cursor-pointer"
+                title="当前为只读，点击可切换到读写模式"
+              >
+                需读写权限
+              </button>
+            )
           )}
 
-          {/* 复制按钮 */}
           <button
             type="button"
             onClick={handleCopy}
@@ -131,7 +237,6 @@ const CodeBlock: React.FC<{
         </div>
       </div>
 
-      {/* 代码内容主体 */}
       <pre className="p-3.5 overflow-x-auto font-mono text-[12.5px] leading-relaxed text-text-primary bg-[var(--code-bg,#1c1c1d)] select-text">
         <code>{code}</code>
       </pre>
@@ -390,7 +495,9 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   workspaceDir,
   onFileWritten,
   onPermissionChange,
-  isStreaming = false
+  isStreaming = false,
+  onOpenFileDiff,
+  onRevertFile,
 }) => {
   if (!content) return null;
 
@@ -404,6 +511,15 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
       return saved !== 'false';
     } catch {
       return true;
+    }
+  });
+
+  // 写入前确认（对标 Cursor/豆包显式确认，默认关闭保持顺滑）
+  const [confirmBeforeWrite, setConfirmBeforeWrite] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('codex_confirm_before_write') === 'true';
+    } catch {
+      return false;
     }
   });
 
@@ -430,11 +546,14 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
     }
 
     const rawHeader = match[1] || '';
-    const language = rawHeader.trim().split(/\s+/)[0] || '';
+    const { language: langFromHeader, headerPath } = parseFenceHeader(rawHeader);
+    const language = langFromHeader || '';
     const rawCode = match[2] ? match[2].replace(/\n$/, '') : '';
 
-    // 嗅探目标文件路径
-    const { filePath, cleanCode } = extractFilePath(rawCode);
+    // 嗅探目标文件路径：fence 头 path 优先，其次首行 filepath 注释
+    const fromBody = extractFilePath(rawCode);
+    const filePath = headerPath || fromBody.filePath;
+    const cleanCode = headerPath ? rawCode : fromBody.cleanCode;
     if (filePath) {
       detectedFiles.push({ filePath, code: cleanCode });
     }
@@ -446,8 +565,19 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
         code={cleanCode}
         targetFilePath={filePath}
         onApplySingle={handleApplySingle}
-        isApplied={filePath ? appliedPaths.has(filePath) : false}
+        isApplied={filePath ? appliedPaths.has(filePath.replace(/\\/g, '/')) : false}
         isWritableMode={isWritableMode}
+        onOpenFileDiff={onOpenFileDiff}
+        onRevertFile={onRevertFile}
+        onReverted={(fp) => {
+          const n = fp.replace(/\\/g, '/');
+          setAppliedPaths((prev) => {
+            const next = new Set(prev);
+            next.delete(n);
+            return next;
+          });
+          autoAppliedRef.current.delete(n);
+        }}
       />
     );
 
@@ -459,23 +589,35 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
     blocks.push(renderParagraphBlock(remainingText, `text_${lastIndex}`));
   }
 
-  // 单文件落盘执行逻辑
+  // 同路径多段合并后再落盘，避免长文被拆成多个残缺文件
+  const mergedFiles = mergeFilesByPath(detectedFiles);
+  const mergedByPath = new Map(mergedFiles.map((f) => [f.filePath, f.code]));
+
+  // 单文件落盘执行逻辑（优先写入该路径的合并全文）
   async function handleApplySingle(filePath: string, fileContent: string) {
     if (!isWritableMode) {
       if (onPermissionChange) onPermissionChange('workspace-readwrite');
       return;
     }
+    const norm = filePath.replace(/\\/g, '/');
+    const contentToWrite = mergedByPath.get(norm) ?? fileContent;
+    if (confirmBeforeWrite) {
+      const ok = window.confirm(`确认将内容写入工作区？\n\n${filePath}`);
+      if (!ok) return;
+    }
     try {
       if (window.codexDesktop?.writeWorkspaceFile) {
         const res = await window.codexDesktop.writeWorkspaceFile({
           relativePath: filePath,
-          content: fileContent,
+          content: contentToWrite,
           createBackup: true
         });
         if (res && res.ok) {
-          setAppliedPaths(prev => new Set(prev).add(filePath));
-          autoAppliedRef.current.add(filePath);
+          setAppliedPaths(prev => new Set(prev).add(norm));
+          autoAppliedRef.current.add(norm);
           if (onFileWritten) onFileWritten(filePath);
+        } else if (res && !res.ok) {
+          alert((res as any).reason || (res as any).error || '写入失败');
         }
       }
     } catch (e) {
@@ -483,15 +625,31 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
     }
   }
 
+  const handleApplyAll = async () => {
+    for (const f of mergedFiles) {
+      const norm = f.filePath.replace(/\\/g, '/');
+      if (!appliedPaths.has(norm)) {
+        await handleApplySingle(f.filePath, f.code);
+      }
+    }
+  };
+
   // 自动落盘流水线：严格仅在真正流式生成刚刚结束（由 true 变为 false）且处于读写模式时自动落盘并通知文件树
   useEffect(() => {
     const justFinishedStreaming = wasStreamingRef.current && !isStreaming;
     wasStreamingRef.current = isStreaming;
 
-    if (justFinishedStreaming && isWritableMode && autoApplyEnabled && detectedFiles.length > 0) {
-      detectedFiles.forEach(async (f) => {
-        if (!autoAppliedRef.current.has(f.filePath)) {
-          autoAppliedRef.current.add(f.filePath);
+    if (
+      justFinishedStreaming &&
+      isWritableMode &&
+      autoApplyEnabled &&
+      !confirmBeforeWrite &&
+      mergedFiles.length > 0
+    ) {
+      mergedFiles.forEach(async (f) => {
+        const norm = f.filePath.replace(/\\/g, '/');
+        if (!autoAppliedRef.current.has(norm)) {
+          autoAppliedRef.current.add(norm);
           try {
             if (window.codexDesktop?.writeWorkspaceFile) {
               const res = await window.codexDesktop.writeWorkspaceFile({
@@ -500,7 +658,7 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
                 createBackup: true
               });
               if (res && res.ok) {
-                setAppliedPaths(prev => new Set(prev).add(f.filePath));
+                setAppliedPaths(prev => new Set(prev).add(norm));
                 if (onFileWritten) onFileWritten(f.filePath);
               }
             }
@@ -510,10 +668,125 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
         }
       });
     }
-  }, [isStreaming, isWritableMode, autoApplyEnabled, detectedFiles, onFileWritten]);
+  }, [isStreaming, isWritableMode, autoApplyEnabled, confirmBeforeWrite, mergedFiles, onFileWritten]);
+
+  const pendingCount = mergedFiles.filter((f) => !appliedPaths.has(f.filePath.replace(/\\/g, '/'))).length;
 
   return (
     <div className="w-full space-y-1.5">
+      {/* 文件变更摘要条（对标 Cursor Apply 文件列表） */}
+      {mergedFiles.length > 0 && !isStreaming && (
+        <div className="my-2 rounded-xl border border-accent/25 bg-accent/5 px-3 py-2 space-y-1.5">
+          <div className="flex items-center justify-between gap-2 text-[11px]">
+            <span className="font-semibold text-text-primary flex items-center gap-1.5">
+              <FileText size={12} className="text-accent" />
+              文件变更 {mergedFiles.length}
+              {pendingCount > 0 ? (
+                <span className="text-text-muted font-normal">· {pendingCount} 待写入</span>
+              ) : (
+                <span className="text-emerald-500 font-normal">· 已全部写入</span>
+              )}
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              <label className="flex items-center gap-1 text-[10px] text-text-muted cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={confirmBeforeWrite}
+                  onChange={(e) => {
+                    const v = e.target.checked;
+                    setConfirmBeforeWrite(v);
+                    try {
+                      localStorage.setItem('codex_confirm_before_write', v ? 'true' : 'false');
+                    } catch { /* ignore */ }
+                  }}
+                  className="accent-[var(--accent,#f97316)]"
+                />
+                写入前确认
+              </label>
+              <label className="flex items-center gap-1 text-[10px] text-text-muted cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={autoApplyEnabled}
+                  onChange={(e) => {
+                    const v = e.target.checked;
+                    setAutoApplyEnabled(v);
+                    try {
+                      localStorage.setItem('codex_auto_apply_files', v ? 'true' : 'false');
+                    } catch { /* ignore */ }
+                  }}
+                  className="accent-[var(--accent,#f97316)]"
+                />
+                自动写入
+              </label>
+              {isWritableMode && pendingCount > 0 && (
+                <button
+                  type="button"
+                  onClick={handleApplyAll}
+                  className="px-2 py-0.5 rounded-md text-[10px] font-medium bg-accent text-white hover:brightness-110 cursor-pointer"
+                >
+                  全部 Apply
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="space-y-0.5">
+            {mergedFiles.map((f) => {
+              const norm = f.filePath.replace(/\\/g, '/');
+              const done = appliedPaths.has(norm);
+              return (
+                <div
+                  key={norm}
+                  className="flex items-center justify-between gap-2 py-0.5 text-[10.5px] font-mono"
+                >
+                  <span className={`truncate ${done ? 'text-emerald-500' : 'text-accent'}`} title={f.filePath}>
+                    {done ? '✓ ' : '○ '}
+                    {f.filePath}
+                  </span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {!done && isWritableMode && (
+                      <button
+                        type="button"
+                        onClick={() => handleApplySingle(f.filePath, f.code)}
+                        className="px-1.5 py-0.5 rounded text-accent hover:bg-accent/15 cursor-pointer"
+                      >
+                        Apply
+                      </button>
+                    )}
+                    {done && onOpenFileDiff && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenFileDiff(f.filePath)}
+                        className="px-1.5 py-0.5 rounded text-text-muted hover:text-accent cursor-pointer"
+                      >
+                        Diff
+                      </button>
+                    )}
+                    {done && onRevertFile && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const ok = window.confirm(`还原 ${f.filePath}？`);
+                          if (!ok) return;
+                          await onRevertFile(f.filePath);
+                          setAppliedPaths((prev) => {
+                            const next = new Set(prev);
+                            next.delete(norm);
+                            return next;
+                          });
+                          autoAppliedRef.current.delete(norm);
+                        }}
+                        className="px-1.5 py-0.5 rounded text-text-muted hover:text-rose-400 cursor-pointer"
+                      >
+                        还原
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {blocks}
     </div>
   );

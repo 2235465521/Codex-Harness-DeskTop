@@ -19,6 +19,7 @@ interface ComposerProps {
   skills: SkillItem[];
   permissionMode: PermissionMode;
   onSelectPermissionMode: (mode: PermissionMode) => void;
+  currentSessionId?: string | null;
 }
 
 const SLASH_COMMANDS = [
@@ -43,6 +44,34 @@ const MAX_TEXT_FILE_BYTES = 256 * 1024;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMAGES = 8;
 const MAX_TEXT_FILES = 10;
+
+function fileExt(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot).toLowerCase() : '';
+}
+
+function isDocxAttachment(file: File): boolean {
+  return fileExt(file.name) === '.docx';
+}
+
+function isPdfAttachment(file: File): boolean {
+  return fileExt(file.name) === '.pdf';
+}
+
+function isIndirectOfficeAttachment(file: File): boolean {
+  const ext = fileExt(file.name);
+  return ext === '.xlsx' || ext === '.xls' || ext === '.doc' || ext === '.pptx';
+}
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
 
 function isTextAttachment(file: File): boolean {
   if (file.type.startsWith('text/')) return true;
@@ -104,10 +133,15 @@ export const Composer: React.FC<ComposerProps> = ({
   skills,
   permissionMode,
   onSelectPermissionMode,
+  currentSessionId,
 }) => {
   const [images, setImages] = useState<AttachedImage[]>([]);
   const [textFiles, setTextFiles] = useState<AttachedTextFile[]>([]);
   const [attachHint, setAttachHint] = useState<string | null>(null);
+
+  useEffect(() => {
+    setAttachHint(null);
+  }, [currentSessionId]);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [showPermissionPicker, setShowPermissionPicker] = useState(false);
@@ -240,6 +274,50 @@ export const Composer: React.FC<ComposerProps> = ({
         continue;
       }
 
+      if (isIndirectOfficeAttachment(file)) {
+        unsupported.push(`${file.name}（请另存为 .txt / .md / .csv）`);
+        continue;
+      }
+
+      if (isDocxAttachment(file) || isPdfAttachment(file)) {
+        const kind = isPdfAttachment(file) ? 'pdf' : 'docx';
+        if (textSlots >= MAX_TEXT_FILES) {
+          blocked.push(`${file.name}(文本附件数已满)`);
+          continue;
+        }
+        if (file.size > 8 * 1024 * 1024) {
+          oversized.push(file.name);
+          continue;
+        }
+        const extract = kind === 'pdf'
+          ? window.codexDesktop?.extractPdfText
+          : window.codexDesktop?.extractDocxText;
+        if (!extract) {
+          unsupported.push(`${file.name}（当前环境不能抽取 ${kind}）`);
+          continue;
+        }
+        try {
+          const buf = await readFileAsArrayBuffer(file);
+          const res = await extract({
+            base64: arrayBufferToBase64(buf),
+            name: file.name,
+          });
+          if (!res?.ok || !res.text) {
+            unsupported.push(`${file.name}（${res?.error || '未能抽出正文'}）`);
+            continue;
+          }
+          textSlots += 1;
+          const label = `${file.name}（已抽取正文）`;
+          setTextFiles((prev) => {
+            if (prev.length >= MAX_TEXT_FILES) return prev;
+            return [...prev, { name: label, content: res.text as string }];
+          });
+        } catch {
+          unsupported.push(file.name);
+        }
+        continue;
+      }
+
       if (isTextAttachment(file)) {
         if (textSlots >= MAX_TEXT_FILES) {
           blocked.push(`${file.name}(文本附件数已满)`);
@@ -272,10 +350,10 @@ export const Composer: React.FC<ComposerProps> = ({
 
     const hints: string[] = [];
     if (unsupported.length > 0) {
-      hints.push(`暂不支持: ${unsupported.join('、')}（仅支持图片与常见文本/代码文件）`);
+      hints.push(`暂不支持: ${unsupported.join('、')}（图片、常见文本/代码，以及可抽取正文的 .docx / .pdf）`);
     }
     if (oversized.length > 0) {
-      hints.push(`文件过大已跳过: ${oversized.join('、')}（文本 ≤256KB / 图片 ≤10MB）`);
+      hints.push(`文件过大已跳过: ${oversized.join('、')}（文本 ≤256KB / 图片 ≤10MB / docx 与 pdf ≤8MB）`);
     }
     if (blocked.length > 0) {
       hints.push(`已拦截: ${blocked.join('、')}（敏感名 / 二进制 / 数量上限）`);
@@ -398,8 +476,16 @@ export const Composer: React.FC<ComposerProps> = ({
       )}
 
       {attachHint && (
-        <div className="mb-2 px-2.5 py-1.5 text-[11px] text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-          {attachHint}
+        <div className="mb-2 px-2.5 py-1.5 text-[11px] text-text-primary bg-bg-card border border-amber-500/40 rounded-lg flex items-start gap-2">
+          <span className="flex-1 leading-snug">{attachHint}</span>
+          <button
+            type="button"
+            onClick={() => setAttachHint(null)}
+            className="shrink-0 text-text-secondary hover:text-text-primary"
+            title="关闭提示"
+          >
+            <X size={12} />
+          </button>
         </div>
       )}
 
@@ -450,6 +536,7 @@ export const Composer: React.FC<ComposerProps> = ({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                   {matchedSkills.map(sk => {
                     const info = getSkillDisplayInfo(sk.id, sk.name, sk.description);
+                    const isUser = (sk.source || 'builtin') === 'user';
                     return (
                       <div
                         key={sk.id}
@@ -457,9 +544,14 @@ export const Composer: React.FC<ComposerProps> = ({
                         className="p-2.5 rounded-lg bg-bg-sidebar/50 hover:bg-bg-hover border border-border/80 hover:border-accent/40 cursor-pointer transition-all space-y-1"
                       >
                         <div className="flex items-center justify-between gap-1">
-                          <span className="text-xs font-bold text-text-primary flex items-center gap-1.5 truncate">
+                          <span className="text-xs font-bold text-text-primary flex items-center gap-1.5 truncate min-w-0">
                             <Wrench size={12} className="text-accent shrink-0" />
                             <span className="truncate" title={info.displayName}>{info.displayName}</span>
+                            {isUser && (
+                              <span className="shrink-0 text-[9px] font-semibold text-emerald-400 px-1 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 whitespace-nowrap">
+                                我的
+                              </span>
+                            )}
                           </span>
                           <span className="text-[10px] font-mono text-accent-warm px-1.5 py-0.2 rounded bg-accent/10 shrink-0">
                             /{sk.id}
@@ -498,7 +590,7 @@ export const Composer: React.FC<ComposerProps> = ({
               ref={fileInputRef}
               onChange={handleFileUpload}
               multiple
-              accept="image/*,.txt,.md,.json,.js,.jsx,.ts,.tsx,.mjs,.cjs,.py,.css,.html,.htm,.yml,.yaml,.xml,.csv,.sh,.ps1,.java,.go,.rs,.toml,.ini"
+              accept="image/*,.txt,.md,.json,.js,.jsx,.ts,.tsx,.mjs,.cjs,.py,.css,.html,.htm,.yml,.yaml,.xml,.csv,.sh,.ps1,.java,.go,.rs,.toml,.ini,.docx,.pdf"
               className="hidden"
             />
           </label>
@@ -578,20 +670,22 @@ export const Composer: React.FC<ComposerProps> = ({
                         onSelectPermissionMode('chat-only');
                         setShowPermissionPicker(false);
                       }}
-                      className={`p-2 rounded-lg cursor-pointer text-xs transition-colors space-y-0.5 border ${
+                      className={`p-2.5 rounded-lg cursor-pointer text-xs transition-colors space-y-1 border ${
                         permissionMode === 'chat-only'
-                          ? 'bg-slate-500/15 border-slate-400/50 text-slate-200 shadow-2xs'
-                          : 'border-transparent hover:bg-bg-hover text-text-secondary'
+                          ? 'bg-bg-card border-accent ring-1 ring-accent/40'
+                          : 'bg-transparent border-transparent hover:bg-bg-hover'
                       }`}
                     >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5 font-semibold text-text-primary">
-                          <MessageSquare size={13} className="text-slate-300 shrink-0" />
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 font-semibold text-text-primary min-w-0">
+                          <MessageSquare size={13} className="text-slate-500 shrink-0" />
                           <span>纯对话咨询 (零文件访问)</span>
                         </div>
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-slate-500/20 text-slate-300 font-mono">隐私防线</span>
+                        <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded border border-border bg-bg-sidebar text-text-primary font-mono">
+                          隐私防线
+                        </span>
                       </div>
-                      <p className="text-[11px] text-text-muted leading-tight">
+                      <p className="text-[11px] text-text-primary leading-snug">
                         完全屏蔽本地文件与工程目录读取，不注水任何代码上下文，零隐私泄密顾虑。
                       </p>
                     </div>
@@ -602,20 +696,22 @@ export const Composer: React.FC<ComposerProps> = ({
                         onSelectPermissionMode('workspace-readonly');
                         setShowPermissionPicker(false);
                       }}
-                      className={`p-2 rounded-lg cursor-pointer text-xs transition-colors space-y-0.5 border ${
+                      className={`p-2.5 rounded-lg cursor-pointer text-xs transition-colors space-y-1 border ${
                         permissionMode === 'workspace-readonly'
-                          ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-200 shadow-2xs'
-                          : 'border-transparent hover:bg-bg-hover text-text-secondary'
+                          ? 'bg-bg-card border-accent ring-1 ring-accent/40'
+                          : 'bg-transparent border-transparent hover:bg-bg-hover'
                       }`}
                     >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5 font-semibold text-text-primary">
-                          <Shield size={13} className="text-emerald-400 shrink-0" />
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 font-semibold text-text-primary min-w-0">
+                          <Shield size={13} className="text-emerald-500 shrink-0" />
                           <span>工作区只读 (默认推荐)</span>
                         </div>
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">代码审计</span>
+                        <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded border border-border bg-bg-sidebar text-text-primary font-mono">
+                          代码审计
+                        </span>
                       </div>
-                      <p className="text-[11px] text-text-muted leading-tight">
+                      <p className="text-[11px] text-text-primary leading-snug">
                         仅允许读取已选工作区代码与文件树大纲，严禁写入，严禁跨越工作区外部。
                       </p>
                     </div>
@@ -626,20 +722,22 @@ export const Composer: React.FC<ComposerProps> = ({
                         onSelectPermissionMode('workspace-readwrite');
                         setShowPermissionPicker(false);
                       }}
-                      className={`p-2 rounded-lg cursor-pointer text-xs transition-colors space-y-0.5 border ${
+                      className={`p-2.5 rounded-lg cursor-pointer text-xs transition-colors space-y-1 border ${
                         permissionMode === 'workspace-readwrite'
-                          ? 'bg-sky-500/15 border-sky-500/50 text-sky-200 shadow-2xs'
-                          : 'border-transparent hover:bg-bg-hover text-text-secondary'
+                          ? 'bg-bg-card border-accent ring-1 ring-accent/40'
+                          : 'bg-transparent border-transparent hover:bg-bg-hover'
                       }`}
                     >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5 font-semibold text-text-primary">
-                          <FileEdit size={13} className="text-sky-400 shrink-0" />
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 font-semibold text-text-primary min-w-0">
+                          <FileEdit size={13} className="text-sky-500 shrink-0" />
                           <span>工作区读写 (自动编码)</span>
                         </div>
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 font-mono">全能开发</span>
+                        <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded border border-border bg-bg-sidebar text-text-primary font-mono">
+                          全能开发
+                        </span>
                       </div>
-                      <p className="text-[11px] text-text-muted leading-tight">
+                      <p className="text-[11px] text-text-primary leading-snug">
                         允许在当前工作区内部读取、创建与编辑代码，物理严格锁死在工程边界内。
                       </p>
                     </div>
@@ -650,20 +748,22 @@ export const Composer: React.FC<ComposerProps> = ({
                         onSelectPermissionMode('full-access');
                         setShowPermissionPicker(false);
                       }}
-                      className={`p-2 rounded-lg cursor-pointer text-xs transition-colors space-y-0.5 border ${
+                      className={`p-2.5 rounded-lg cursor-pointer text-xs transition-colors space-y-1 border ${
                         permissionMode === 'full-access'
-                          ? 'bg-amber-500/15 border-amber-500/50 text-amber-200 shadow-2xs'
-                          : 'border-transparent hover:bg-bg-hover text-text-secondary'
+                          ? 'bg-bg-card border-accent ring-1 ring-accent/40'
+                          : 'bg-transparent border-transparent hover:bg-bg-hover'
                       }`}
                     >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5 font-semibold text-text-primary">
-                          <Globe size={13} className="text-amber-400 shrink-0" />
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 font-semibold text-text-primary min-w-0">
+                          <Globe size={13} className="text-amber-500 shrink-0" />
                           <span>全局受信任 (完全控制)</span>
                         </div>
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-mono">系统级</span>
+                        <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded border border-border bg-bg-sidebar text-text-primary font-mono">
+                          系统级
+                        </span>
                       </div>
-                      <p className="text-[11px] text-text-muted leading-tight">
+                      <p className="text-[11px] text-text-primary leading-snug">
                         允许跨工程读取本机任意系统路径文件，切换时触发主进程系统级确认弹窗。
                       </p>
                     </div>

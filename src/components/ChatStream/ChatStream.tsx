@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ChevronDown, ChevronRight, Copy, Check, ArrowDown, Loader2, Undo2,
-  ArrowLeftRight, ThumbsUp, ThumbsDown, RotateCcw, Sparkles
+  ArrowLeftRight, ThumbsUp, ThumbsDown, RotateCcw, Sparkles, Download, FileText
 } from 'lucide-react';
 import { ChatMessage } from '@/types/session';
 import { PermissionMode } from '@/types/electron';
@@ -16,6 +16,8 @@ interface ChatStreamProps {
   onFileWritten?: (filePath: string) => void;
   onPermissionChange?: (mode: PermissionMode) => void;
   onRevokeMessage?: (messageIndex: number) => void;
+  onOpenFileDiff?: (filePath: string) => void;
+  onRevertFile?: (filePath: string) => Promise<void> | void;
 }
 
 export const ChatStream: React.FC<ChatStreamProps> = ({
@@ -27,6 +29,8 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
   onFileWritten,
   onPermissionChange,
   onRevokeMessage,
+  onOpenFileDiff,
+  onRevertFile,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const streamEndRef = useRef<HTMLDivElement>(null);
@@ -37,6 +41,8 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
   const [expandedThinking, setExpandedThinking] = useState<Record<number, boolean>>({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [feedbackState, setFeedbackState] = useState<Record<number, 'up' | 'down' | null>>({});
+  const [exportMenuIdx, setExportMenuIdx] = useState<number | null>(null);
+  const [exportingIdx, setExportingIdx] = useState<number | null>(null);
 
   // 动态计时器：流式生成时实时累加秒数
   const [liveElapsedSeconds, setLiveElapsedSeconds] = useState(1);
@@ -54,6 +60,15 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
       if (timer) clearInterval(timer);
     };
   }, [isGenerating]);
+
+  // 监听全局点击关闭 ... 菜单 / 导出菜单
+  useEffect(() => {
+    const handleGlobalClick = () => {
+      setExportMenuIdx(null);
+    };
+    window.addEventListener('click', handleGlobalClick);
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, []);
 
   const scrollToBottom = (behavior: ScrollBehavior = 'smooth') => {
     streamEndRef.current?.scrollIntoView({ behavior });
@@ -90,6 +105,40 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
     navigator.clipboard.writeText(text);
     setCopiedIdx(idx);
     setTimeout(() => setCopiedIdx(null), 2000);
+  };
+
+  const handleExportMessage = async (
+    content: string,
+    idx: number,
+    format: 'md' | 'txt' | 'docx' | 'pdf'
+  ) => {
+    if (!content?.trim()) return;
+    if (!window.codexDesktop?.exportChatArtifact) {
+      alert('当前环境不支持导出文件');
+      return;
+    }
+    setExportMenuIdx(null);
+    setExportingIdx(idx);
+    try {
+      const res = await window.codexDesktop.exportChatArtifact({
+        content,
+        title: 'Codex 回答导出',
+        format,
+        defaultName: `codex-answer-${idx + 1}`,
+      });
+      if (res?.canceled) return;
+      if (!res?.ok) {
+        alert(res?.error || '导出失败');
+        return;
+      }
+      if (res.filePath && window.codexDesktop.showItemInFolder) {
+        window.codexDesktop.showItemInFolder(res.filePath);
+      }
+    } catch (e: any) {
+      alert(e?.message || '导出异常');
+    } finally {
+      setExportingIdx(null);
+    }
   };
 
   const toggleThinking = (idx: number) => {
@@ -267,11 +316,13 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                       onFileWritten={onFileWritten}
                       onPermissionChange={onPermissionChange as any}
                       isStreaming={isGenerating && isLastMessage}
+                      onOpenFileDiff={onOpenFileDiff}
+                      onRevertFile={onRevertFile}
                     />
                   </div>
 
-                  {/* 3. 底部轻量微图标动作栏 (复制、点赞、点踩、重新生成、时间戳) */}
-                  <div className="flex items-center gap-2 pt-1 text-text-muted select-none">
+                  {/* 3. 底部轻量微图标动作栏 (复制、导出、点赞、点踩、重新生成、时间戳) */}
+                  <div className="flex items-center gap-2 pt-1 text-text-muted select-none relative">
                     {/* 复制 */}
                     <button
                       type="button"
@@ -281,6 +332,51 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                     >
                       {copiedIdx === idx ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
                     </button>
+
+                    {/* 导出（对齐豆包下载：MD / TXT / Word / PDF） */}
+                    <div className="relative" onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        disabled={!!(isGenerating && isLastMessage) || exportingIdx === idx || !msg.content?.trim()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExportMenuIdx(exportMenuIdx === idx ? null : idx);
+                        }}
+                        className="p-1 rounded hover:bg-bg-hover text-text-muted hover:text-text-primary transition-colors cursor-pointer disabled:opacity-40"
+                        title="导出为文件"
+                      >
+                        {exportingIdx === idx ? (
+                          <Loader2 size={13} className="animate-spin text-accent" />
+                        ) : (
+                          <Download size={13} />
+                        )}
+                      </button>
+                      {exportMenuIdx === idx && (
+                        <div className="absolute left-0 bottom-full mb-1 z-30 min-w-[148px] py-1 rounded-lg border border-border bg-bg-card shadow-xl text-[11px]">
+                          <div className="px-2.5 py-1 text-[10px] text-text-muted flex items-center gap-1 border-b border-border/60">
+                            <FileText size={10} />
+                            导出回答
+                          </div>
+                          {(
+                            [
+                              { key: 'md' as const, label: 'Markdown (.md)' },
+                              { key: 'txt' as const, label: '纯文本 (.txt)' },
+                              { key: 'docx' as const, label: 'Word (.docx)' },
+                              { key: 'pdf' as const, label: 'PDF (.pdf)' },
+                            ]
+                          ).map((opt) => (
+                            <button
+                              key={opt.key}
+                              type="button"
+                              onClick={() => handleExportMessage(msg.content, idx, opt.key)}
+                              className="w-full text-left px-2.5 py-1.5 hover:bg-bg-hover text-text-secondary hover:text-text-primary cursor-pointer"
+                            >
+                              {opt.label}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
 
                     {/* 点赞 */}
                     <button

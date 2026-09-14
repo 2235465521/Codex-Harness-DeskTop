@@ -5,6 +5,7 @@ import { Composer } from '@/components/Composer/Composer';
 import { PreviewPanel } from '@/components/PreviewPanel/PreviewPanel';
 import { StatusBar, GenerationMetrics } from '@/components/StatusBar';
 import { SettingsModal } from '@/components/Modals/SettingsModal';
+import { ConnectorsModal } from '@/components/Modals/ConnectorsModal';
 import { ThemeModal } from '@/components/Modals/ThemeModal';
 import { AboutModal } from '@/components/Modals/AboutModal';
 import { FeedbackModal } from '@/components/Modals/FeedbackModal';
@@ -18,12 +19,247 @@ import { useTabQueue } from '@/hooks/useTabQueue';
 import { useUpdater } from '@/hooks/useUpdater';
 
 import { AttachedImage, ChatMessage } from '@/types/session';
-import { SkillItem, PermissionMode, WorkspaceFileItem } from '@/types/electron';
-import { Download, Layers } from 'lucide-react';
+import { SkillItem, PermissionMode, WorkspaceFileItem, ConnectorToolInfo } from '@/types/electron';
+import { Download, Layers, Plug } from 'lucide-react';
 
 function normalizeFsPath(p?: string | null): string {
   if (!p) return '';
   return p.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+const AT_FILE_EXT = 'docx|xlsx|xls|pdf|doc|pptx|txt|md|json|js|jsx|ts|tsx|mjs|cjs|py|css|html|htm|yml|yaml|xml|csv|sh|ps1|java|go|rs|toml|ini|vue';
+
+/** 从消息里抽出 @路径。支持中文、空格，以及 @"路径" 引号形式。 */
+function extractAtFileRefs(text: string): string[] {
+  const found: string[] = [];
+  const re = new RegExp(
+    `@"([^"]+)"|@'([^']+)'|@([^\\s@"'][^\\n@]*?\\.(?:${AT_FILE_EXT}))(?=[\\s,，。；;）)]|$)`,
+    'gi'
+  );
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const p = (m[1] || m[2] || m[3] || '').trim();
+    if (p) found.push(p);
+  }
+  return [...new Set(found)];
+}
+
+function indirectOfficeHint(rel: string): string | null {
+  const dot = rel.lastIndexOf('.');
+  const ext = dot >= 0 ? rel.slice(dot).toLowerCase() : '';
+  if (ext === '.xlsx' || ext === '.xls' || ext === '.doc' || ext === '.pptx') {
+    return `【文件未挂载: ${rel}】该格式不能直接读取，请另存为 .txt / .md / .csv 后再用 @ 引用`;
+  }
+  return null;
+}
+
+/** OpenAI / Anthropic 共用的工作区写盘工具定义 */
+const WRITE_WORKSPACE_FILE_TOOL_OPENAI = {
+  type: 'function' as const,
+  function: {
+    name: 'write_workspace_file',
+    description:
+      '将完整文件内容写入当前 Codex Desktop 工作区。用于创建或覆盖代码、Markdown 文档等。content 必须是完整文件正文，禁止省略占位符。',
+    parameters: {
+      type: 'object',
+      properties: {
+        relativePath: {
+          type: 'string',
+          description: '相对工作区根目录的路径，如 docs/report.md 或 src/App.tsx',
+        },
+        content: {
+          type: 'string',
+          description: '完整文件内容',
+        },
+      },
+      required: ['relativePath', 'content'],
+    },
+  },
+};
+
+const WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC = {
+  name: 'write_workspace_file',
+  description: WRITE_WORKSPACE_FILE_TOOL_OPENAI.function.description,
+  input_schema: WRITE_WORKSPACE_FILE_TOOL_OPENAI.function.parameters,
+};
+
+type CodexToolCall = { id?: string; name: string; arguments: string };
+
+/** 解析标记块兜底：@@@write_file path="a.md"\\n...@@@end */
+function extractTaggedWriteFiles(text: string): { relativePath: string; content: string }[] {
+  const out: { relativePath: string; content: string }[] = [];
+  const re = /@@@write_file\s+path=["']([^"']+)["']\s*\r?\n([\s\S]*?)@@@end/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.push({ relativePath: m[1].trim().replace(/^[./\\]+/, ''), content: m[2].replace(/^\uFEFF/, '') });
+  }
+  return out;
+}
+
+async function executeWriteWorkspaceTools(
+  toolCalls: CodexToolCall[],
+  onFileWritten?: (path: string) => void
+): Promise<{ lines: string[]; results: { id: string; name: string; content: string }[] }> {
+  const lines: string[] = [];
+  const results: { id: string; name: string; content: string }[] = [];
+  for (let i = 0; i < toolCalls.length; i++) {
+    const tc = toolCalls[i];
+    const callId = tc.id || `call_${i}_${Date.now()}`;
+    if (tc.name !== 'write_workspace_file') {
+      const msg = `⏭ 忽略未知工具 \`${tc.name}\``;
+      lines.push(`- ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    let args: { relativePath?: string; content?: string } = {};
+    try {
+      args = JSON.parse(tc.arguments || '{}');
+    } catch {
+      const msg = 'write_workspace_file 参数 JSON 解析失败';
+      lines.push(`- ❌ ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    const relativePath = String(args.relativePath || '').trim();
+    const content = typeof args.content === 'string' ? args.content : '';
+    if (!relativePath || !content) {
+      const msg = 'write_workspace_file 缺少 relativePath 或 content';
+      lines.push(`- ❌ ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    if (!window.codexDesktop?.writeWorkspaceFile) {
+      const msg = '当前环境不支持写盘';
+      lines.push(`- ❌ ${msg}`);
+      results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+      continue;
+    }
+    try {
+      const res = await window.codexDesktop.writeWorkspaceFile({
+        relativePath,
+        content,
+        createBackup: true,
+      });
+      if (res?.ok) {
+        lines.push(`- ✅ 已写入 \`${relativePath}\``);
+        results.push({
+          id: callId,
+          name: tc.name,
+          content: JSON.stringify({ ok: true, relativePath }),
+        });
+        onFileWritten?.(relativePath);
+      } else {
+        const err = (res as any)?.reason || (res as any)?.error || '未知错误';
+        lines.push(`- ❌ 写入失败 \`${relativePath}\`: ${err}`);
+        results.push({
+          id: callId,
+          name: tc.name,
+          content: JSON.stringify({ ok: false, relativePath, error: err }),
+        });
+      }
+    } catch (e: any) {
+      const err = e?.message || String(e);
+      lines.push(`- ❌ 写入异常 \`${relativePath}\`: ${err}`);
+      results.push({
+        id: callId,
+        name: tc.name,
+        content: JSON.stringify({ ok: false, relativePath, error: err }),
+      });
+    }
+  }
+  return { lines, results };
+}
+
+/** 写盘 / MCP 工具多轮上限（首轮 + 续轮，对齐连接器规格默认 5） */
+const MAX_WRITE_TOOL_ROUNDS = 5;
+
+function isAgentToolName(name: string) {
+  return name === 'write_workspace_file' || name.startsWith('mcp__');
+}
+
+function connectorToolsToOpenAI(tools: ConnectorToolInfo[]) {
+  return tools
+    .filter((t) => t.qualifiedName && t.name && !t.error)
+    .map((t) => ({
+      type: 'function' as const,
+      function: {
+        name: t.qualifiedName as string,
+        description: `[连接器:${t.connectorName || t.connectorId}] ${t.description || t.name}`,
+        parameters: t.inputSchema || { type: 'object', properties: {} },
+      },
+    }));
+}
+
+function connectorToolsToAnthropic(tools: ConnectorToolInfo[]) {
+  return tools
+    .filter((t) => t.qualifiedName && t.name && !t.error)
+    .map((t) => ({
+      name: t.qualifiedName as string,
+      description: `[连接器:${t.connectorName || t.connectorId}] ${t.description || t.name}`,
+      input_schema: t.inputSchema || { type: 'object', properties: {} },
+    }));
+}
+
+async function executeAgentTools(
+  toolCalls: CodexToolCall[],
+  onFileWritten?: (path: string) => void
+): Promise<{ lines: string[]; results: { id: string; name: string; content: string }[] }> {
+  const lines: string[] = [];
+  const results: { id: string; name: string; content: string }[] = [];
+
+  for (let i = 0; i < toolCalls.length; i++) {
+    const tc = toolCalls[i];
+    const callId = tc.id || `call_${i}_${Date.now()}`;
+
+    if (tc.name === 'write_workspace_file') {
+      const one = await executeWriteWorkspaceTools([{ ...tc, id: callId }], onFileWritten);
+      lines.push(...one.lines);
+      results.push(...one.results);
+      continue;
+    }
+
+    if (tc.name.startsWith('mcp__')) {
+      const parts = tc.name.split('__');
+      const connectorId = parts[1] || '';
+      const toolName = parts.slice(2).join('__');
+      if (!connectorId || !toolName || !window.codexDesktop?.callConnectorTool) {
+        const msg = 'MCP 工具调用参数不完整或环境不支持';
+        lines.push(`- ❌ ${msg}`);
+        results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+        continue;
+      }
+      try {
+        const res = await window.codexDesktop.callConnectorTool({
+          connectorId,
+          name: toolName,
+          arguments: tc.arguments,
+        });
+        if (res?.ok) {
+          const content =
+            typeof res.result === 'string'
+              ? res.result
+              : JSON.stringify(res.result ?? {}, null, 0).slice(0, 80000);
+          lines.push(`- ✅ MCP \`${toolName}\`（${connectorId}）`);
+          results.push({ id: callId, name: tc.name, content });
+        } else {
+          const err = res?.error || '调用失败';
+          lines.push(`- ❌ MCP \`${toolName}\`: ${err}`);
+          results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: err }) });
+        }
+      } catch (e: any) {
+        const err = e?.message || String(e);
+        lines.push(`- ❌ MCP 异常 \`${toolName}\`: ${err}`);
+        results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: err }) });
+      }
+      continue;
+    }
+
+    const msg = `忽略未知工具 \`${tc.name}\``;
+    lines.push(`- ⏭ ${msg}`);
+    results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
+  }
+
+  return { lines, results };
 }
 
 export const App: React.FC = () => {
@@ -78,12 +314,14 @@ export const App: React.FC = () => {
     hasBackup?: boolean;
   } | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isConnectorsOpen, setIsConnectorsOpen] = useState(false);
   const [isThemeOpen, setIsThemeOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [inputPrompt, setInputPrompt] = useState('');
   const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [skillsTabSignal, setSkillsTabSignal] = useState(0);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('workspace-readonly');
   const [activeWorkspaceDir, setActiveWorkspaceDir] = useState<string | null>(null);
   const [workspaceRefreshTrigger, setWorkspaceRefreshTrigger] = useState(0);
@@ -283,6 +521,20 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  // 呼出 / 菜单时刷新合并技能列表，使新建/导入的用户技能即时可见
+  const slashMenuOpen = inputPrompt.startsWith('/');
+  useEffect(() => {
+    if (!slashMenuOpen) return;
+    if (!window.codexDesktop?.getSkills) return;
+    let cancelled = false;
+    window.codexDesktop.getSkills().then(list => {
+      if (!cancelled && Array.isArray(list)) setSkills(list);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [slashMenuOpen]);
+
   // 监听原生主菜单 IPC 事件
   useEffect(() => {
     if (window.codexDesktop && window.codexDesktop.onMenuAction) {
@@ -326,6 +578,22 @@ export const App: React.FC = () => {
       setIsPreviewOpen(true);
       return;
     }
+    if (trimmed === '/skills' || trimmed === '/skills/') {
+      setSkillsTabSignal((n) => n + 1);
+      const skillsHint: ChatMessage = {
+        role: 'assistant',
+        model: selectedModel,
+        thinking: '技能库',
+        content:
+          `📚 **已打开左侧「技能」面板**（共 ${skills.length} 项）\n` +
+          `- 点选技能详情 →「填入指令」或在输入框输入 \`/<技能id> 你的任务\`\n` +
+          `- 「我的」页可导入/新建/编辑/删除自定义技能（内置技能不可删）\n` +
+          `- 发送前会刷新技能列表，新建后可立即 \`/id\` 激活`,
+        timestamp: Date.now(),
+      };
+      addMessageToCurrentSession(skillsHint);
+      return;
+    }
     if (trimmed === '/status') {
       const statusMsg: ChatMessage = {
         role: 'assistant',
@@ -342,7 +610,7 @@ export const App: React.FC = () => {
         role: 'assistant',
         model: selectedModel,
         thinking: '帮助说明',
-        content: `📖 **Codex Desktop 快捷操作指南**\n- 输入 \`/\`：呼出系统指令与 43 项工程技能库\n- 输入 \`/status\`：检查当前模型通道与内核就绪状态\n- 输入 \`/diff\`：打开右侧工作区变更预览\n- 输入 \`/clear\`：清空当前会话\n- 输入 \`@文件名\`：在输入框中精准注入文件源码引用\n- 粘贴图片 (\`Ctrl+V\`)：多模态看图编程`,
+        content: `📖 **Codex Desktop 快捷操作指南**\n- 输入 \`/\`：呼出系统指令与技能库\n- 输入 \`/skills\`：打开左侧技能面板\n- 输入 \`/<技能id> 任务\`：激活技能并注入 SKILL.md\n- 输入 \`/status\`：检查当前模型通道与内核就绪状态\n- 输入 \`/diff\`：打开右侧工作区变更预览\n- 输入 \`/clear\`：清空当前会话\n- 输入 \`@相对路径\`：挂载工作区文本；\`.docx\` / \`.pdf\` 会抽取正文（支持中文路径）\n- 粘贴图片 (\`Ctrl+V\`)：多模态看图编程`,
         timestamp: Date.now()
       };
       addMessageToCurrentSession(helpMsg);
@@ -361,14 +629,28 @@ export const App: React.FC = () => {
   const executeLLMTask = async (text: string, images: AttachedImage[]) => {
     setIsGenerating(true);
 
-    // 检查是否命中了 43 项技能之一 (例如: /code-review 或 /tdd 或 /maker-checker)
+    // 发送前刷新技能列表，确保新建/导入的用户技能可立即被 /id 激活
+    let skillsSnapshot = skills;
+    if (window.codexDesktop?.getSkills) {
+      try {
+        const list = await window.codexDesktop.getSkills();
+        if (Array.isArray(list)) {
+          skillsSnapshot = list;
+          setSkills(list);
+        }
+      } catch {
+        /* 沿用内存快照 */
+      }
+    }
+
+    // 检查是否命中技能 (内置或用户自定义，例如: /code-review 或 /my-skill)
     let activeSkill: SkillItem | null = null;
     let actualUserPrompt = text;
 
     const skillMatch = text.match(/^\/([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/);
     if (skillMatch) {
       const candidateId = skillMatch[1].toLowerCase();
-      const found = skills.find(s => s.id.toLowerCase() === candidateId || s.name.toLowerCase() === candidateId);
+      const found = skillsSnapshot.find(s => s.id.toLowerCase() === candidateId || s.name.toLowerCase() === candidateId);
       if (found) {
         activeSkill = found;
         actualUserPrompt = (skillMatch[2] || '').trim() || `请按照【${found.name}】技能规范执行任务。`;
@@ -442,17 +724,20 @@ export const App: React.FC = () => {
         }
 
         let modeTitle = '📖 工作区只读模式 (Workspace Read-Only)';
-        let modeRule = '你当前处于工作区只读安全沙箱。当前环境采用【即时上下文全量注入架构】，请基于下方已提供的工作区大纲和上下文挂载文件，立即直接给出完整分析、代码诊断或推演方案。绝对严禁输出“让我读取核心文件...”等等待二次交互的中断性语句，严禁尝试发起工具调用。';
+        let modeRule =
+          '你当前处于工作区只读安全沙箱。请基于下方已提供的工作区大纲和上下文挂载文件，立即直接给出完整分析、代码诊断或推演方案；严禁输出“让我读取核心文件...”等中断性语句。\n' +
+          '【工具边界】禁止调用 `write_workspace_file` 及任何本地写盘标记（filepath / @@@write_file）。若会话已挂载 MCP 连接器工具（名称以 `mcp__` 开头），仅可用于远程只读检索/查询，不得据此改写本地工程文件。';
         if (permissionMode === 'workspace-readwrite') {
           modeTitle = '✍️ 工作区读写模式 (Workspace Read/Write - 自动修改工程落盘)';
           modeRule = '【核心直写架构认知】你正运行在 Codex Desktop 工业级桌面端中，当前环境已直接授权你修改本地工程文件！客户端内置代码与文档自动落盘引擎，只要你在代码块第一行清晰标注 `// filepath: <相对路径>`（如 `// filepath: src/App.tsx`、`# filepath: config.py`、或 Markdown 文档 `<!-- filepath: docs/架构报告.md -->`），客户端在生成结束时将全自动直接修改并写入本地物理磁盘，并联动刷新左侧文件树与抽屉。\n' +
             '【输出纯粹性规约】客户端界面已自动为带 filepath 的代码块呈现完整的目标文件名与落盘状态，绝对严禁在代码块外部输出“已写入工作区xxx”、“若工作区没有请手动保存为同名文件”等自我推诿的套话和废话！直接输出分析正文和带 filepath 的代码块即可。\n' +
-            '【文档与长文本产出规约】当用户要求生成文档、审查报告、设计方案、测试用例或 PRD 等长篇交付物时，为了给用户最舒适的阅读与归档体验，必须将完整文档正文包裹在带有目标文件路径的 Markdown 代码块中（如 ````markdown\n<!-- filepath: docs/DISTRIBUTION-AUDIT.md -->\n# 文档正文...\n````），而在外部对话流中仅保留 2~3 句核心要点摘要。客户端将全自动为用户将文件存入工作区对应目录，免去界面冗长刷屏与手动保存的烦恼。\n' +
+            '【文档与长文本产出规约】当用户要求生成文档、审查报告、设计方案、测试用例或 PRD 等长篇交付物时，必须将完整正文放入**同一个**带 filepath 的 Markdown 代码块（如 ````markdown\n<!-- filepath: docs/REPORT.md -->\n# 全文...\n````）；对话区仅保留 2~3 句摘要。严禁拆成「第1部分/第2部分」、多个不同路径或半截后说“未完待续”。若单次输出长度不够，后续续写必须复用**完全相同**的 filepath，客户端会自动拼接为同一文件。\n' +
+            '【工具写盘（推荐）】你可以使用工具 `write_workspace_file`（参数 relativePath + content）直接写入工作区完整文件；也可使用标记块：\n@@@write_file path="docs/a.md"\n全文\n@@@end\n优先工具/标记写完整文件，比多个残缺代码块更可靠。\n' +
             '【工程目录洁癖规约】严禁在工程根目录下随地创建临时测试或排查脚本！生成的诊断或排查脚本必须收纳在 `scripts/` 目录下（如 `scripts/diagnose-target.ps1`），技术文档必须收纳在 `docs/` 目录下，严禁污染工程根目录。\n' +
             '【绝对红线规约】绝对严禁向用户声称“我无法直接写文件”、“没有直接往磁盘写文件的通道”或“落盘必须你手动操作”，绝对严禁要求用户手动复制粘贴或保存文件！直接输出带 filepath 的完整内容即可，输出即代表直接落地！';
         } else if (permissionMode === 'full-access') {
           modeTitle = '🌐 全局受信任模式 (Full Access)';
-          modeRule = '你拥有全局代码与文档直接修改落盘权限。所有带 filepath 的代码或 Markdown 文档块将直接写入磁盘。涉及生成长篇报告或文档时，请包裹在指定路径的代码块中直接写入工作区。临时脚本收纳在 scripts/，文档收纳在 docs/。严禁输出“若未落盘请手动保存”等推诿废话。';
+          modeRule = '你拥有全局代码与文档直接修改落盘权限。优先调用工具 write_workspace_file，或使用 @@@write_file 标记，或带 filepath 的代码块。长篇文档必须使用同一路径；禁止拆成多个残缺文件。临时脚本收纳在 scripts/，文档收纳在 docs/。严禁输出“若未落盘请手动保存”等推诿废话。';
         }
 
         workspaceSystemPrompt = `【当前工作区工程环境与安全运行权限】\n` +
@@ -503,7 +788,7 @@ export const App: React.FC = () => {
 
       // 3. 智能关联工作区文件内容 (@引用文件或工程分析/进度评估请求)
       let finalUserContent = actualUserPrompt;
-      const atFileMatches = Array.from(actualUserPrompt.matchAll(/@([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)/g)).map(m => m[1]);
+      const atFileMatches = extractAtFileRefs(actualUserPrompt);
       const isAnalyzingWorkspace = /(分析|评估|看|梳理|走读|做到|进度|现状|架构).*(文件夹|工程|项目|代码|哪一步|模块|系统)/i.test(actualUserPrompt) ||
         /(项目|工程|代码).*(怎么样|到哪|进展)/i.test(actualUserPrompt);
       const filesToRead = new Set(atFileMatches);
@@ -524,16 +809,27 @@ export const App: React.FC = () => {
         let attachedCount = 0;
         for (const rel of filesToRead) {
           if (attachedCount >= 5) break; // 最多挂载 5 个关键入口文件，防止超长
+          const blockedOffice = indirectOfficeHint(rel);
+          if (blockedOffice) {
+            attachedContents.push(blockedOffice);
+            attachedCount++;
+            continue;
+          }
           try {
             const fileRes = await window.codexDesktop.readWorkspaceFile(rel);
             if (fileRes.ok && fileRes.content) {
-              attachedContents.push(`【文件挂载: ${rel}】\n\`\`\`\n${fileRes.content}\n\`\`\``);
+              const label = /\.(docx|pdf)$/i.test(rel)
+                ? `【文件挂载: ${rel}（已抽取正文）】`
+                : `【文件挂载: ${rel}】`;
+              attachedContents.push(`${label}\n\`\`\`\n${fileRes.content}\n\`\`\``);
               attachedCount++;
-            } else if (!fileRes.ok && fileRes.code !== 'NOT_FOUND') {
-              attachedContents.push(`【文件读取受限: ${rel}】: ${fileRes.reason || fileRes.code}`);
+            } else if (!fileRes.ok) {
+              attachedContents.push(`【文件读取失败: ${rel}】${fileRes.reason || fileRes.code || '未知错误'}`);
+              attachedCount++;
             }
-          } catch (e) {
-            // 容错
+          } catch (e: any) {
+            attachedContents.push(`【文件读取失败: ${rel}】${e?.message || '读取异常'}`);
+            attachedCount++;
           }
         }
         if (attachedContents.length > 0) {
@@ -563,6 +859,8 @@ export const App: React.FC = () => {
       let response: { content?: string; thinking?: string; toolCall?: any } | null = null;
       const streamId = 'stream_' + Date.now();
       activeStreamIdRef.current = streamId;
+      let collectedToolCalls: CodexToolCall[] = [];
+      let streamedContentAcc = '';
 
       // 先在会话中追加占位的 Assistant 消息，随着流式接收实时增量填充
       const initialThinking = activeSkill ? `🧠 技能【${activeSkill.name}】已激活，正在思考...` : '正在思考与组织回复...';
@@ -603,48 +901,102 @@ export const App: React.FC = () => {
             }
 
             if (data.contentDelta || data.thinkingDelta) {
+              if (data.contentDelta) streamedContentAcc += data.contentDelta;
               updateLastMessageInCurrentSession(prev => ({
                 ...prev,
                 content: (prev.content || '') + (data.contentDelta || ''),
                 thinking: data.thinkingDelta ? (prev.thinking || '') + data.thinkingDelta : prev.thinking
               }));
             }
+
+            if (data.isDone && Array.isArray(data.toolCalls) && data.toolCalls.length > 0) {
+              collectedToolCalls = data.toolCalls
+                .filter((t: any) => t && t.name)
+                .map((t: any) => ({
+                  id: t.id,
+                  name: t.name,
+                  arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {}),
+                }));
+            }
           }
         });
+      }
+
+      const canUseWriteTools =
+        permissionMode === 'workspace-readwrite' || permissionMode === 'full-access';
+
+      let mcpToolsOpenAI: ReturnType<typeof connectorToolsToOpenAI> = [];
+      let mcpToolsAnthropic: ReturnType<typeof connectorToolsToAnthropic> = [];
+      if (window.codexDesktop?.listConnectorTools) {
+        try {
+          const listed = await window.codexDesktop.listConnectorTools();
+          if (listed?.ok && Array.isArray(listed.tools)) {
+            mcpToolsOpenAI = connectorToolsToOpenAI(listed.tools);
+            mcpToolsAnthropic = connectorToolsToAnthropic(listed.tools);
+          }
+        } catch (e) {
+          console.warn('加载连接器工具失败:', e);
+        }
       }
 
       if (window.codexDesktop && window.codexDesktop.callLlmApi) {
         let endpoint = effectiveBaseUrl;
         let body: any = {};
 
+        // 长文档完整落盘：默认 16384；若模型配置了 maxTokens 则采用（夹在 4096~128000）
+        const modelCfg = provider.modelConfigs?.find(
+          (c) => c.name.toLowerCase() === selectedModel.toLowerCase()
+        );
+        const effectiveMaxTokens = Math.max(
+          4096,
+          Math.min(128000, typeof modelCfg?.maxTokens === 'number' && modelCfg.maxTokens > 0 ? modelCfg.maxTokens : 16384)
+        );
+
         if (effectiveProtocol === 'anthropic') {
           if (!endpoint.endsWith('/messages')) endpoint += '/v1/messages';
           const systemPrompts = contextMessages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
+          const aTools = [
+            ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC] : []),
+            ...mcpToolsAnthropic,
+          ];
           body = {
             model: selectedModel,
-            max_tokens: 4096,
+            max_tokens: effectiveMaxTokens,
             stream: true,
             messages: contextMessages.filter(m => m.role !== 'system'),
-            system: systemPrompts || undefined
+            system: systemPrompts || undefined,
+            ...(aTools.length ? { tools: aTools } : {})
           };
         } else if (effectiveProtocol === 'ollama') {
           if (!endpoint.endsWith('/chat/completions') && !endpoint.endsWith('/api/chat')) {
             endpoint += '/v1/chat/completions';
           }
+          const oTools = [
+            ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+            ...mcpToolsOpenAI,
+          ];
           body = {
             model: selectedModel,
             stream: true,
-            messages: contextMessages
+            max_tokens: effectiveMaxTokens,
+            messages: contextMessages,
+            ...(oTools.length ? { tools: oTools, tool_choice: 'auto' } : {})
           };
         } else {
           // OpenAI 兼容协议 (支持 DeepSeek, GLM, OpenAI 等)
           if (!endpoint.endsWith('/chat/completions')) {
             endpoint += '/chat/completions';
           }
+          const oTools = [
+            ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+            ...mcpToolsOpenAI,
+          ];
           body = {
             model: selectedModel,
             stream: true,
-            messages: contextMessages
+            max_tokens: effectiveMaxTokens,
+            messages: contextMessages,
+            ...(oTools.length ? { tools: oTools, tool_choice: 'auto' } : {})
           };
         }
 
@@ -682,11 +1034,28 @@ export const App: React.FC = () => {
             const text = (parsed.content || []).map((c: any) => c.text || '').join('');
             const thinking = (parsed.content || []).filter((c: any) => c.type === 'thinking').map((c: any) => c.thinking).join('\n');
             response = { content: text, thinking };
+            const anthropicTools = (parsed.content || [])
+              .filter((c: any) => c.type === 'tool_use' && c.name)
+              .map((c: any) => ({
+                id: c.id,
+                name: c.name,
+                arguments: typeof c.input === 'string' ? c.input : JSON.stringify(c.input || {}),
+              }));
+            if (anthropicTools.length) collectedToolCalls = anthropicTools;
           } else {
             const choice = parsed.choices?.[0];
             const text = choice?.message?.content || parsed.message?.content || parsed.response || '';
             const thinking = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
             response = { content: text, thinking };
+            if (Array.isArray(parsed.codex_tool_calls) && parsed.codex_tool_calls.length) {
+              collectedToolCalls = parsed.codex_tool_calls;
+            } else if (Array.isArray(choice?.message?.tool_calls)) {
+              collectedToolCalls = choice.message.tool_calls.map((tc: any) => ({
+                id: tc.id,
+                name: tc.function?.name || tc.name,
+                arguments: tc.function?.arguments || '{}',
+              }));
+            }
           }
 
           // 若流式已输出，保持已有内容；若未收到流式内容，做兜底覆盖
@@ -695,6 +1064,249 @@ export const App: React.FC = () => {
             content: prev.content || response?.content || '⚠️ 未收到有效模型回复，请检查 Base URL 与 API Key 是否正确。',
             thinking: response?.thinking || prev.thinking || '任务思考已完成。'
           }));
+
+          // Wave D + MCP：执行写盘/连接器工具 + @@@write_file 标记兜底 + 有限多轮续跑
+          {
+            const toolResults: string[] = [];
+            let lastApiToolCalls = collectedToolCalls.filter((t) => isAgentToolName(t.name));
+            let lastAssistantText = streamedContentAcc || response?.content || '';
+            let roundMessages: any[] = [...contextMessages];
+            let toolRound = 0;
+
+            if (lastApiToolCalls.length > 0) {
+              // 补全 tool call id，供后续 role=tool 关联
+              lastApiToolCalls = lastApiToolCalls.map((tc, i) => ({
+                ...tc,
+                id: tc.id || `call_${Date.now()}_${i}`,
+              }));
+              const exec1 = await executeAgentTools(lastApiToolCalls, handleFileWritten);
+              toolResults.push(...exec1.lines);
+              let results = exec1.results;
+
+              while (
+                lastApiToolCalls.length > 0 &&
+                toolRound < MAX_WRITE_TOOL_ROUNDS - 1 &&
+                activeStreamIdRef.current
+              ) {
+                toolRound += 1;
+
+                if (effectiveProtocol === 'anthropic') {
+                  const assistantContent: any[] = [];
+                  if (lastAssistantText.trim()) {
+                    assistantContent.push({ type: 'text', text: lastAssistantText });
+                  }
+                  for (const tc of lastApiToolCalls) {
+                    let input: any = {};
+                    try { input = JSON.parse(tc.arguments || '{}'); } catch { input = {}; }
+                    assistantContent.push({
+                      type: 'tool_use',
+                      id: tc.id,
+                      name: tc.name,
+                      input,
+                    });
+                  }
+                  roundMessages = [
+                    ...roundMessages,
+                    { role: 'assistant', content: assistantContent },
+                    {
+                      role: 'user',
+                      content: results.map((r) => ({
+                        type: 'tool_result',
+                        tool_use_id: r.id,
+                        content: r.content,
+                      })),
+                    },
+                  ];
+                } else {
+                  roundMessages = [
+                    ...roundMessages,
+                    {
+                      role: 'assistant',
+                      content: lastAssistantText || null,
+                      tool_calls: lastApiToolCalls.map((tc) => ({
+                        id: tc.id,
+                        type: 'function',
+                        function: { name: tc.name, arguments: tc.arguments || '{}' },
+                      })),
+                    },
+                    ...results.map((r) => ({
+                      role: 'tool',
+                      tool_call_id: r.id,
+                      content: r.content,
+                    })),
+                  ];
+                }
+
+                updateLastMessageInCurrentSession((prev) => ({
+                  ...prev,
+                  thinking: `${prev.thinking || ''}\n🔄 工具结果已回传，第 ${toolRound + 1} 轮续跑...`.trim(),
+                }));
+
+                const contStreamId = `${streamId}_tool${toolRound}`;
+                activeStreamIdRef.current = contStreamId;
+                let contContentAcc = '';
+                let contToolCalls: CodexToolCall[] = [];
+
+                if (unsubscribeStream) {
+                  unsubscribeStream();
+                  unsubscribeStream = null;
+                }
+                if (window.codexDesktop?.onLlmStreamChunk) {
+                  unsubscribeStream = window.codexDesktop.onLlmStreamChunk((data) => {
+                    if (data.streamId !== contStreamId) return;
+                    if (data.contentDelta) {
+                      contContentAcc += data.contentDelta;
+                      updateLastMessageInCurrentSession((prev) => ({
+                        ...prev,
+                        content: (prev.content || '') + data.contentDelta,
+                      }));
+                    }
+                    if (data.thinkingDelta) {
+                      updateLastMessageInCurrentSession((prev) => ({
+                        ...prev,
+                        thinking: (prev.thinking || '') + data.thinkingDelta,
+                      }));
+                    }
+                    if (data.isDone && Array.isArray(data.toolCalls) && data.toolCalls.length > 0) {
+                      contToolCalls = data.toolCalls
+                        .filter((t: any) => t && t.name)
+                        .map((t: any) => ({
+                          id: t.id,
+                          name: t.name,
+                          arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {}),
+                        }));
+                    }
+                  });
+                }
+
+                let contEndpoint = effectiveBaseUrl;
+                let contBody: any = {};
+                if (effectiveProtocol === 'anthropic') {
+                  if (!contEndpoint.endsWith('/messages')) contEndpoint += '/v1/messages';
+                  const systemPrompts = roundMessages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
+                  const contATools = [
+                    ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC] : []),
+                    ...mcpToolsAnthropic,
+                  ];
+                  contBody = {
+                    model: selectedModel,
+                    max_tokens: effectiveMaxTokens,
+                    stream: true,
+                    messages: roundMessages.filter((m) => m.role !== 'system'),
+                    system: systemPrompts || undefined,
+                    ...(contATools.length ? { tools: contATools } : {}),
+                  };
+                } else {
+                  if (effectiveProtocol === 'ollama') {
+                    if (!contEndpoint.endsWith('/chat/completions') && !contEndpoint.endsWith('/api/chat')) {
+                      contEndpoint += '/v1/chat/completions';
+                    }
+                  } else if (!contEndpoint.endsWith('/chat/completions')) {
+                    contEndpoint += '/chat/completions';
+                  }
+                  const contOTools = [
+                    ...(canUseWriteTools ? [WRITE_WORKSPACE_FILE_TOOL_OPENAI] : []),
+                    ...mcpToolsOpenAI,
+                  ];
+                  contBody = {
+                    model: selectedModel,
+                    stream: true,
+                    max_tokens: effectiveMaxTokens,
+                    messages: roundMessages,
+                    ...(contOTools.length ? { tools: contOTools, tool_choice: 'auto' } : {}),
+                  };
+                }
+
+                const contRes: any = await window.codexDesktop.callLlmApi({
+                  endpoint: contEndpoint,
+                  apiKey: effectiveApiKey,
+                  body: contBody,
+                  stream: true,
+                  streamId: contStreamId,
+                  timeout: matchedModel?.timeoutSeconds,
+                });
+
+                if (!contRes?.ok) break;
+
+                const contParsed = typeof contRes.body === 'string' ? JSON.parse(contRes.body) : contRes.body;
+                if (effectiveProtocol === 'anthropic') {
+                  const text = (contParsed.content || []).map((c: any) => c.text || '').join('');
+                  if (!contContentAcc && text) {
+                    contContentAcc = text;
+                    updateLastMessageInCurrentSession((prev) => ({
+                      ...prev,
+                      content: `${prev.content || ''}${text}`,
+                    }));
+                  }
+                  const anthropicTools = (contParsed.content || [])
+                    .filter((c: any) => c.type === 'tool_use' && c.name)
+                    .map((c: any) => ({
+                      id: c.id,
+                      name: c.name,
+                      arguments: typeof c.input === 'string' ? c.input : JSON.stringify(c.input || {}),
+                    }));
+                  if (anthropicTools.length) contToolCalls = anthropicTools;
+                } else {
+                  const choice = contParsed.choices?.[0];
+                  const text = choice?.message?.content || '';
+                  if (!contContentAcc && text) {
+                    contContentAcc = text;
+                    updateLastMessageInCurrentSession((prev) => ({
+                      ...prev,
+                      content: `${prev.content || ''}${text}`,
+                    }));
+                  }
+                  if (Array.isArray(contParsed.codex_tool_calls) && contParsed.codex_tool_calls.length) {
+                    contToolCalls = contParsed.codex_tool_calls;
+                  } else if (Array.isArray(choice?.message?.tool_calls)) {
+                    contToolCalls = choice.message.tool_calls.map((tc: any) => ({
+                      id: tc.id,
+                      name: tc.function?.name || tc.name,
+                      arguments: tc.function?.arguments || '{}',
+                    }));
+                  }
+                }
+
+                lastAssistantText = contContentAcc;
+                lastApiToolCalls = contToolCalls
+                  .filter((t) => isAgentToolName(t.name))
+                  .map((tc, i) => ({ ...tc, id: tc.id || `call_${Date.now()}_${toolRound}_${i}` }));
+
+                if (lastApiToolCalls.length === 0) break;
+
+                const next = await executeAgentTools(lastApiToolCalls, handleFileWritten);
+                toolResults.push(...next.lines);
+                results = next.results;
+              }
+            }
+
+            if (canUseWriteTools) {
+              const textForTags = streamedContentAcc || response?.content || '';
+              const tagged = extractTaggedWriteFiles(textForTags);
+              if (tagged.length > 0) {
+                const asTools: CodexToolCall[] = tagged.map((t, i) => ({
+                  id: `tag_${i}`,
+                  name: 'write_workspace_file',
+                  arguments: JSON.stringify({ relativePath: t.relativePath, content: t.content }),
+                }));
+                const { lines } = await executeWriteWorkspaceTools(asTools, handleFileWritten);
+                toolResults.push(...lines);
+                updateLastMessageInCurrentSession((prev) => ({
+                  ...prev,
+                  content: (prev.content || '')
+                    .replace(/@@@write_file\s+path=["'][^"']+["']\s*\r?\n[\s\S]*?@@@end/gi, '')
+                    .trim(),
+                }));
+              }
+            }
+
+            if (toolResults.length > 0) {
+              updateLastMessageInCurrentSession((prev) => ({
+                ...prev,
+                content: `${prev.content || ''}\n\n---\n**🔧 工具执行结果**\n${toolResults.join('\n')}`.trim(),
+              }));
+            }
+          }
         } else {
           let errText = rawRes?.body;
           if (typeof errText === 'object') errText = JSON.stringify(errText);
@@ -817,6 +1429,7 @@ export const App: React.FC = () => {
           activeWorkspaceDir={activeWorkspaceDir}
           onWorkspaceChange={handleWorkspaceChange}
           refreshTrigger={workspaceRefreshTrigger}
+          skillsTabSignal={skillsTabSignal}
         />
 
         {/* 中间主工作台 */}
@@ -860,6 +1473,14 @@ export const App: React.FC = () => {
 
             <div className="flex items-center gap-2">
               <button
+                onClick={() => setIsConnectorsOpen(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs text-text-secondary hover:text-text-primary hover:bg-bg-hover rounded-lg transition-colors"
+                title="配置 MCP 连接器（标准大数据等）"
+              >
+                <Plug size={13} />
+                <span>连接器</span>
+              </button>
+              <button
                 onClick={exportCurrentSessionAsMarkdown}
                 className="flex items-center gap-1.5 px-2.5 py-1 text-xs text-text-secondary hover:text-text-primary hover:bg-bg-hover rounded-lg transition-colors"
                 title="导出当前会话为 Markdown 文档"
@@ -891,6 +1512,8 @@ export const App: React.FC = () => {
             onFileWritten={handleFileWritten}
             onPermissionChange={handleSelectPermissionMode}
             onRevokeMessage={handleRevokeMessage}
+            onOpenFileDiff={handleFileWritten}
+            onRevertFile={handleRevertFile}
           />
 
           {/* 底部 Composer 输入区 */}
@@ -908,6 +1531,7 @@ export const App: React.FC = () => {
             skills={skills}
             permissionMode={permissionMode}
             onSelectPermissionMode={handleSelectPermissionMode}
+            currentSessionId={currentSessionId}
           />
         </main>
 
@@ -934,6 +1558,11 @@ export const App: React.FC = () => {
         onClose={() => setIsSettingsOpen(false)}
         providers={providers}
         onSaveProviders={saveProviders}
+      />
+
+      <ConnectorsModal
+        isOpen={isConnectorsOpen}
+        onClose={() => setIsConnectorsOpen(false)}
       />
 
       <ThemeModal

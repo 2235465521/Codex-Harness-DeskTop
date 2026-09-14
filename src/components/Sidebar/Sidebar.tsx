@@ -29,6 +29,7 @@ import { ChatSession, WorkspaceFolder } from '@/types/session';
 import { SkillItem, WorkspaceFileItem } from '@/types/electron';
 import { SKILL_CATEGORIES, SkillCategory, getSkillDisplayInfo, SKILLS_DICTIONARY } from '@/data/skillsDictionary';
 import { SkillDetailModal } from '@/components/Modals/SkillDetailModal';
+import { UserSkillEditorModal, UserSkillDraft } from '@/components/Modals/UserSkillEditorModal';
 import { ArchiveModal } from '@/components/Modals/ArchiveModal';
 
 function formatRelativeTime(timestamp: number): string {
@@ -74,6 +75,8 @@ interface SidebarProps {
   activeWorkspaceDir?: string | null;
   onWorkspaceChange?: (path: string) => void;
   refreshTrigger?: number;
+  /** 外部递增时切换到技能 Tab（如 /skills） */
+  skillsTabSignal?: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -96,12 +99,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
   activeWorkspaceDir,
   onWorkspaceChange,
   refreshTrigger,
+  skillsTabSignal = 0,
 }) => {
   const [activeTab, setActiveTab] = useState<'sessions' | 'files' | 'skills'>('sessions');
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [skillSearch, setSkillSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<SkillCategory>('all');
+  const [skillSourceFilter, setSkillSourceFilter] = useState<'all' | 'builtin' | 'user'>('all');
   const [selectedSkillForModal, setSelectedSkillForModal] = useState<SkillItem | null>(null);
+  const [userSkillEditor, setUserSkillEditor] = useState<{
+    open: boolean;
+    mode: 'create' | 'edit';
+    draft: UserSkillDraft | null;
+  }>({ open: false, mode: 'create', draft: null });
 
   // 会话重命名与操作菜单浮层状态
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
@@ -146,20 +156,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [folderChildrenMap, setFolderChildrenMap] = useState<Record<string, WorkspaceFileItem[]>>({});
   const [loadingFolders, setLoadingFolders] = useState<Record<string, boolean>>({});
 
-  // ↔️ 侧边栏自由拖拽拉伸宽度 (范围 220px ~ 600px，持久化保存)
+  // ↔️ 侧边栏自由拖拽拉伸宽度 (范围 280px ~ 600px，默认 320，持久化保存)
+  const SIDEBAR_MIN_W = 280;
+  const SIDEBAR_MAX_W = 600;
+  const SIDEBAR_DEFAULT_W = 320;
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     try {
       const saved = localStorage.getItem('codex_sidebar_width');
-      if (saved) return Math.max(220, Math.min(600, parseInt(saved, 10)));
+      if (saved) return Math.max(SIDEBAR_MIN_W, Math.min(SIDEBAR_MAX_W, parseInt(saved, 10)));
     } catch (e) {}
-    return 260;
+    return SIDEBAR_DEFAULT_W;
   });
   const [isResizing, setIsResizing] = useState(false);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isResizing) return;
-      const newWidth = Math.max(220, Math.min(600, e.clientX));
+      const newWidth = Math.max(SIDEBAR_MIN_W, Math.min(SIDEBAR_MAX_W, e.clientX));
       setSidebarWidth(newWidth);
     };
     const handleMouseUp = () => {
@@ -275,13 +288,52 @@ export const Sidebar: React.FC<SidebarProps> = ({
     setCollapsedWorkspaces(prev => ({ ...prev, [key]: !prev[key] }));
   };
 
-  useEffect(() => {
-    if (window.codexDesktop && window.codexDesktop.getSkills) {
+  const refreshSkills = () => {
+    if (window.codexDesktop?.getSkills) {
       window.codexDesktop.getSkills().then(list => {
         if (Array.isArray(list)) setSkills(list);
       });
     }
+  };
+
+  useEffect(() => {
+    refreshSkills();
   }, []);
+
+  useEffect(() => {
+    if (skillsTabSignal > 0) {
+      setActiveTab('skills');
+      refreshSkills();
+    }
+  }, [skillsTabSignal]);
+
+  const handleImportUserSkill = async () => {
+    if (!window.codexDesktop?.importUserSkill) {
+      alert('当前环境不支持导入用户技能');
+      return;
+    }
+    const res = await window.codexDesktop.importUserSkill();
+    if (res?.canceled) return;
+    if (!res?.ok) {
+      alert(res?.error || '导入失败');
+      return;
+    }
+    refreshSkills();
+    setSkillSourceFilter('user');
+  };
+
+  const handleDeleteUserSkill = async (skill: SkillItem) => {
+    if (!skill.editable || !window.codexDesktop?.deleteUserSkill) return;
+    const ok = window.confirm(`确定删除自定义技能「${skill.name}」(/${skill.id})？此操作不可恢复。`);
+    if (!ok) return;
+    const res = await window.codexDesktop.deleteUserSkill(skill.id);
+    if (!res?.ok) {
+      alert(res?.error || '删除失败');
+      return;
+    }
+    setSelectedSkillForModal(null);
+    refreshSkills();
+  };
 
   // 挂载或工作区路径变化时加载真实工程文件树
   const loadWorkspaceTree = async (dirPath: string) => {
@@ -372,8 +424,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const filteredSkills = skills.filter(s => {
+    const source = s.source || 'builtin';
+    if (skillSourceFilter === 'builtin' && source !== 'builtin') return false;
+    if (skillSourceFilter === 'user' && source !== 'user') return false;
     const info = getSkillDisplayInfo(s.id, s.name, s.description);
-    if (selectedCategory !== 'all' && info.category !== selectedCategory) {
+    // 自定义技能无词典分类：选「我的」或 source=user 时不套内置业务分类过滤
+    if (
+      selectedCategory !== 'all' &&
+      source !== 'user' &&
+      info.category !== selectedCategory
+    ) {
       return false;
     }
     if (!skillSearch.trim()) return true;
@@ -1135,6 +1195,63 @@ export const Sidebar: React.FC<SidebarProps> = ({
               />
             </div>
 
+            {/* 来源筛选 + 用户技能轻量工具条（增量，不改原布局结构） */}
+            <div className="px-1 flex items-center justify-between gap-1">
+              <div className="flex items-center gap-0.5 text-[10px] shrink-0">
+                {([
+                  { key: 'all' as const, label: '全部' },
+                  { key: 'builtin' as const, label: '内置' },
+                  { key: 'user' as const, label: '我的' },
+                ]).map(opt => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => setSkillSourceFilter(opt.key)}
+                    className={`px-1.5 py-0.5 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                      skillSourceFilter === opt.key
+                        ? 'bg-accent/15 text-accent font-semibold'
+                        : 'text-text-muted hover:text-text-secondary hover:bg-bg-hover'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-0.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleImportUserSkill}
+                  className="px-1.5 py-0.5 text-[10px] text-text-secondary hover:text-text-primary hover:bg-bg-hover rounded cursor-pointer"
+                  title="从本地目录导入 SKILL.md"
+                >
+                  导入
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setUserSkillEditor({
+                      open: true,
+                      mode: 'create',
+                      draft: null,
+                    })
+                  }
+                  className="px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent/10 rounded cursor-pointer flex items-center gap-0.5"
+                  title="新建自定义技能"
+                >
+                  <Plus size={10} />
+                  新建
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.codexDesktop?.openUserSkillsDir?.()}
+                  className="p-1 text-text-muted hover:text-text-primary hover:bg-bg-hover rounded cursor-pointer"
+                  title="打开 ~/.codex/user-skills/"
+                >
+                  <FolderOpen size={12} />
+                </button>
+              </div>
+            </div>
+
             {/* 分类胶囊过滤条 */}
             <div className="flex items-center gap-1 overflow-x-auto pb-1 px-1 no-scrollbar text-[11px]">
               {SKILL_CATEGORIES.map(cat => (
@@ -1158,9 +1275,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
               {filteredSkills.length > 0 ? (
                 filteredSkills.map(sk => {
                   const info = getSkillDisplayInfo(sk.id, sk.name, sk.description);
+                  const isUser = (sk.source || 'builtin') === 'user';
                   return (
                     <div
-                      key={sk.id}
+                      key={`${sk.source || 'builtin'}:${sk.id}`}
                       onClick={() => setSelectedSkillForModal(sk)}
                       className="p-2 bg-bg-card hover:bg-bg-hover border border-border hover:border-accent/40 rounded-xl transition-all flex items-center justify-between gap-2 group cursor-pointer"
                       title={`点击查看“${info.displayName}”实战用法与示例`}
@@ -1171,6 +1289,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                           <span className="font-semibold text-xs text-text-primary truncate">
                             {info.displayName}
                           </span>
+                          {isUser && (
+                            <span className="text-[9px] px-1 py-px rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0">
+                              我的
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-1.5 mt-0.5">
                           <span className="font-mono text-[10px] text-accent font-medium px-1 rounded bg-accent/5 border border-accent/15 shrink-0">
@@ -1203,17 +1326,39 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   );
                 })
               ) : (
-                <div className="py-8 text-center text-xs text-text-muted space-y-2">
-                  <div>未搜索到匹配的技能</div>
-                  <button
-                    onClick={() => {
-                      setSkillSearch('');
-                      setSelectedCategory('all');
-                    }}
-                    className="text-accent underline text-[11px]"
-                  >
-                    重置筛选条件
-                  </button>
+                <div className="py-8 text-center text-xs text-text-muted space-y-2 px-2">
+                  {skillSourceFilter === 'user' && !skillSearch.trim() && selectedCategory === 'all' ? (
+                    <>
+                      <div>还没有自定义技能</div>
+                      <div className="flex items-center justify-center gap-2 text-[11px]">
+                        <button type="button" onClick={handleImportUserSkill} className="text-accent underline cursor-pointer">
+                          导入
+                        </button>
+                        <span className="text-text-muted">或</span>
+                        <button
+                          type="button"
+                          onClick={() => setUserSkillEditor({ open: true, mode: 'create', draft: null })}
+                          className="text-accent underline cursor-pointer"
+                        >
+                          新建
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div>未搜索到匹配的技能</div>
+                      <button
+                        onClick={() => {
+                          setSkillSearch('');
+                          setSelectedCategory('all');
+                          setSkillSourceFilter('all');
+                        }}
+                        className="text-accent underline text-[11px] cursor-pointer"
+                      >
+                        重置筛选条件
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -1267,6 +1412,31 @@ export const Sidebar: React.FC<SidebarProps> = ({
         onClose={() => setSelectedSkillForModal(null)}
         skill={selectedSkillForModal}
         onInsertPrompt={onInsertPrompt}
+        onEditUserSkill={(sk) => {
+          setSelectedSkillForModal(null);
+          setUserSkillEditor({
+            open: true,
+            mode: 'edit',
+            draft: {
+              id: sk.id,
+              name: sk.name,
+              description: sk.description,
+              body: sk.prompt || sk.content || '',
+            },
+          });
+        }}
+        onDeleteUserSkill={handleDeleteUserSkill}
+      />
+
+      <UserSkillEditorModal
+        isOpen={userSkillEditor.open}
+        mode={userSkillEditor.mode}
+        initial={userSkillEditor.draft}
+        onClose={() => setUserSkillEditor((s) => ({ ...s, open: false }))}
+        onSaved={() => {
+          refreshSkills();
+          setSkillSourceFilter('user');
+        }}
       />
 
       {/* 归档到工作区弹窗 (让用户明确选择归档到哪个工作区) */}

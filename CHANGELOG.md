@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### 🔌 MCP 连接器（标准大数据 / 豆包）
+- 🌐 **Streamable HTTP MCP 客户端**：配置存 `~/.codex/connectors.json`；API Key 经 `safeStorage` 加密。
+- 🧪 **连接器设置 UI**：顶栏「连接器」→ 填写 URL/Key、测连通、启用、预览 tools。
+- 🧰 **对话工具挂接**：已启用连接器的 tools 以 `mcp__{id}__{name}` 注入 LLM；与写盘工具同环执行。
+- 📡 **预置**：`stsc-data-platform` → `http://47.106.104.48:8089/api/v1/openapi/doubao/mcp`。
+
+## [v1.1.8] - 2026-09-12
+### 📄 长文落盘 · Word OOXML · 工具写盘环 · 自定义 Skills
+- 📁 **用户自定义 Skills（MVP）**：`~/.codex/user-skills/` 与内置热同步隔离；侧栏导入/新建/编辑/删除；发送 `/id` 前刷新列表。
+- 🏷️ **Composer「我的」角标**：斜杠技能菜单对 `source=user` 显示「我的」标签。
+- 📝 **长文完整落盘**：默认 `max_tokens=16384`；同 filepath 多块自动合并；写盘工具 `write_workspace_file` + `@@@write_file` 兜底。
+- 🔄 **写盘工具多轮续跑**：工具结果回传模型，最多 3 轮（`MAX_WRITE_TOOL_ROUNDS`）。
+- 💬 **消息导出**：MD / TXT / 真正 OOXML `.docx`（标题/列表/代码围栏/行内样式）/ PDF。
+- ✅ **Apply 卡片**：Diff / 还原 / 写入前确认；侧栏默认宽度 320。
+
+### ✨ 用户自定义 Skills（MVP）明细
+- 🔌 新增导入 / 新建 / 编辑 / 删除 IPC；`get-skills` 合并内置与用户列表（同 id 内置优先）。
+- 🧭 技能 Tab：来源筛选（全部/内置/我的）、导入/新建/打开目录；详情页可编辑删除用户技能。
+
 ## [v1.1.7] - 2026-09-09
 ### 🛡️ 安全沙箱与附件通道正式发版
 - 🛡️ **写盘先 contain 再 mkdir**：拦截 `../` 穿透时不再在工作区外留下 mkdir 副作用目录。
