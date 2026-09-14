@@ -728,7 +728,8 @@ function isAllowedUpdateDownloadUrl(downloadUrl) {
   }
   // 加速镜像代理白名单（仅允许针对本仓库 Releases 资产的代理加速）
   if (host === "ghfast.top" || host === "mirror.ghproxy.com" || host === "ghproxy.net") {
-    return pathname.includes("/Simon-yyy/Codex-Harness-DeskTop/releases/");
+    return pathname.includes("/Simon-yyy/Codex-Harness-DeskTop/releases/") ||
+           pathname.includes("/2235465521/Codex-Harness-DeskTop/releases/");
   }
   return false;
 }
