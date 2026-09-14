@@ -68,7 +68,479 @@ function decodeXmlText(s) {
     .replace(/&amp;/g, "&");
 }
 
-/** 从 OOXML .docx 抽出段落纯文本（不把二进制塞给模型） */
+function extractTag(xml, tagName) {
+  const startTagRegex = new RegExp(`<${tagName}(?:\\s+[^>]*)?>`, 'i');
+  const startMatch = startTagRegex.exec(xml);
+  if (!startMatch) return null;
+  const startIndex = startMatch.index + startMatch[0].length;
+  const closeTag = `</${tagName}>`;
+  let depth = 1;
+  let pos = startIndex;
+  while (pos < xml.length) {
+    const openRegex = new RegExp(`<${tagName}(?:[\\s>/])`, 'ig');
+    openRegex.lastIndex = pos;
+    const openMatch = openRegex.exec(xml);
+    const nextOpen = openMatch ? openMatch.index : -1;
+    const nextClose = xml.indexOf(closeTag, pos);
+    if (nextClose === -1) break;
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      depth++;
+      pos = nextOpen + tagName.length + 1;
+    } else {
+      depth--;
+      if (depth === 0) {
+        return {
+          content: xml.slice(startIndex, nextClose),
+          tagHeader: startMatch[0],
+          fullMatch: xml.slice(startMatch.index, nextClose + closeTag.length),
+          start: startMatch.index,
+          end: nextClose + closeTag.length
+        };
+      }
+      pos = nextClose + closeTag.length;
+    }
+  }
+  return null;
+}
+
+/** 递归解析 OMML (Office Math Markup Language) 转译为标准 LaTeX */
+function ommlToLatex(xmlSnippet) {
+  if (!xmlSnippet || typeof xmlSnippet !== 'string') return '';
+
+  function parseNodes(str) {
+    if (!str) return '';
+    let result = '';
+    let i = 0;
+
+    while (i < str.length) {
+      const nextTagStart = str.indexOf('<', i);
+      if (nextTagStart === -1) break;
+      const tagMatch = /^<([a-zA-Z0-9_:]+)(?:\s+([^>]*))?(\/?)>/.exec(str.slice(nextTagStart));
+      if (!tagMatch) {
+        i = nextTagStart + 1;
+        continue;
+      }
+      const rawTagName = tagMatch[1];
+      const localName = rawTagName.includes(':') ? rawTagName.split(':')[1] : rawTagName;
+      const isSelfClosing = tagMatch[3] === '/';
+
+      if (isSelfClosing) {
+        i = nextTagStart + tagMatch[0].length;
+        continue;
+      }
+
+      const extracted = extractTag(str.slice(nextTagStart), rawTagName);
+      if (!extracted) {
+        i = nextTagStart + tagMatch[0].length;
+        continue;
+      }
+
+      const innerXml = extracted.content;
+      i = nextTagStart + extracted.end;
+
+      switch (localName) {
+        case 'oMath':
+        case 'oMathPara':
+        case 'e':
+          result += parseNodes(innerXml);
+          break;
+        case 't':
+          result += mapMathText(decodeXmlText(innerXml));
+          break;
+        case 'r':
+          result += parseNodes(innerXml);
+          break;
+        case 'f': {
+          const numObj = extractTag(innerXml, 'm:num') || extractTag(innerXml, 'num');
+          const denObj = extractTag(innerXml, 'm:den') || extractTag(innerXml, 'den');
+          const num = numObj ? parseNodes(numObj.content) : '';
+          const den = denObj ? parseNodes(denObj.content) : '';
+          result += `\\frac{${num.trim()}}{${den.trim()}}`;
+          break;
+        }
+        case 'sSup': {
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const supObj = extractTag(innerXml, 'm:sup') || extractTag(innerXml, 'sup');
+          const base = baseObj ? parseNodes(baseObj.content) : '';
+          const sup = supObj ? parseNodes(supObj.content) : '';
+          result += `{${base.trim()}}^{${sup.trim()}}`;
+          break;
+        }
+        case 'sSub': {
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const subObj = extractTag(innerXml, 'm:sub') || extractTag(innerXml, 'sub');
+          const base = baseObj ? parseNodes(baseObj.content) : '';
+          const sub = subObj ? parseNodes(subObj.content) : '';
+          result += `{${base.trim()}}_{${sub.trim()}}`;
+          break;
+        }
+        case 'sSubSup': {
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const subObj = extractTag(innerXml, 'm:sub') || extractTag(innerXml, 'sub');
+          const supObj = extractTag(innerXml, 'm:sup') || extractTag(innerXml, 'sup');
+          const base = baseObj ? parseNodes(baseObj.content) : '';
+          const sub = subObj ? parseNodes(subObj.content) : '';
+          const sup = supObj ? parseNodes(supObj.content) : '';
+          result += `{${base.trim()}}_{${sub.trim()}}^{${sup.trim()}}`;
+          break;
+        }
+        case 'rad': {
+          const degObj = extractTag(innerXml, 'm:deg') || extractTag(innerXml, 'deg');
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const deg = degObj ? parseNodes(degObj.content).trim() : '';
+          const base = baseObj ? parseNodes(baseObj.content).trim() : '';
+          if (deg) result += `\\sqrt[${deg}]{${base}}`;
+          else result += `\\sqrt{${base}}`;
+          break;
+        }
+        case 'nary': {
+          let op = '\\sum';
+          const prObj = extractTag(innerXml, 'm:naryPr') || extractTag(innerXml, 'naryPr');
+          if (prObj) {
+            const chrMatch = /val="([^"]+)"/.exec(prObj.content);
+            if (chrMatch) {
+              const ch = chrMatch[1];
+              if (ch === '∫') op = '\\int';
+              else if (ch === '∬') op = '\\iint';
+              else if (ch === '∭') op = '\\iiint';
+              else if (ch === '∮') op = '\\oint';
+              else if (ch === '∏') op = '\\prod';
+              else if (ch === '⋂') op = '\\bigcap';
+              else if (ch === '⋃') op = '\\bigcup';
+              else if (ch === '∑') op = '\\sum';
+            }
+          }
+          const subObj = extractTag(innerXml, 'm:sub') || extractTag(innerXml, 'sub');
+          const supObj = extractTag(innerXml, 'm:sup') || extractTag(innerXml, 'sup');
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const sub = subObj ? parseNodes(subObj.content).trim() : '';
+          const sup = supObj ? parseNodes(supObj.content).trim() : '';
+          const base = baseObj ? parseNodes(baseObj.content).trim() : '';
+          let naryStr = op;
+          if (sub) naryStr += `_{${sub}}`;
+          if (sup) naryStr += `^{${sup}}`;
+          result += `${naryStr} ${base}`;
+          break;
+        }
+        case 'd': {
+          let beg = '(';
+          let end = ')';
+          const prObj = extractTag(innerXml, 'm:dPr') || extractTag(innerXml, 'dPr');
+          if (prObj) {
+            const begMatch = /<m:begChr[^>]*val="([^"]*)"/.exec(prObj.content);
+            const endMatch = /<m:endChr[^>]*val="([^"]*)"/.exec(prObj.content);
+            if (begMatch) beg = begMatch[1];
+            if (endMatch) end = endMatch[1];
+          }
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const base = baseObj ? parseNodes(baseObj.content).trim() : '';
+          const mapDelimiter = (ch) => {
+            if (!ch) return '.';
+            if (ch === '{') return '\\{';
+            if (ch === '}') return '\\}';
+            if (ch === '|') return '|';
+            if (ch === '||' || ch === '‖') return '\\|';
+            return ch;
+          };
+          result += `\\left${mapDelimiter(beg)} ${base} \\right${mapDelimiter(end)}`;
+          break;
+        }
+        case 'm': {
+          const rows = [];
+          let searchIdx = 0;
+          while (searchIdx < innerXml.length) {
+            const rowExtracted = extractTag(innerXml.slice(searchIdx), 'm:mr') || extractTag(innerXml.slice(searchIdx), 'mr');
+            if (!rowExtracted) break;
+            searchIdx += rowExtracted.end;
+            const cells = [];
+            let cellSearch = 0;
+            while (cellSearch < rowExtracted.content.length) {
+              const cellExtracted = extractTag(rowExtracted.content.slice(cellSearch), 'm:e') || extractTag(rowExtracted.content.slice(cellSearch), 'e');
+              if (!cellExtracted) break;
+              cellSearch += cellExtracted.end;
+              cells.push(parseNodes(cellExtracted.content).trim());
+            }
+            if (cells.length) rows.push(cells.join(' & '));
+          }
+          if (rows.length) result += `\\begin{matrix} ${rows.join(' \\\\ ')} \\end{matrix}`;
+          break;
+        }
+        case 'acc': {
+          let chr = '^';
+          const prObj = extractTag(innerXml, 'm:accPr') || extractTag(innerXml, 'accPr');
+          if (prObj) {
+            const chrMatch = /val="([^"]+)"/.exec(prObj.content);
+            if (chrMatch) chr = chrMatch[1];
+          }
+          const baseObj = extractTag(innerXml, 'm:e') || extractTag(innerXml, 'e');
+          const base = baseObj ? parseNodes(baseObj.content).trim() : '';
+          if (chr === '̂' || chr === '^') result += `\\hat{${base}}`;
+          else if (chr === '̄' || chr === '-') result += `\\bar{${base}}`;
+          else if (chr === '⃗' || chr === '→') result += `\\vec{${base}}`;
+          else if (chr === '̇') result += `\\dot{${base}}`;
+          else if (chr === '̈') result += `\\ddot{${base}}`;
+          else if (chr === '̃' || chr === '~') result += `\\tilde{${base}}`;
+          else result += `\\bar{${base}}`;
+          break;
+        }
+        default:
+          result += parseNodes(innerXml);
+          break;
+      }
+    }
+    return result;
+  }
+
+  function mapMathText(text) {
+    if (!text) return '';
+    const symbolMap = {
+      '±': '\\pm ', '×': '\\times ', '÷': '\\div ', '·': '\\cdot ',
+      '≤': '\\le ', '≥': '\\ge ', '≠': '\\ne ', '≈': '\\approx ',
+      '≡': '\\equiv ', '∈': '\\in ', '∉': '\\notin ', '⊂': '\\subset ',
+      '⊆': '\\subseteq ', '∪': '\\cup ', '∩': '\\cap ', '∧': '\\land ',
+      '∨': '\\lor ', '¬': '\\neg ', '⇒': '\\Rightarrow ', '⇔': '\\Leftrightarrow ',
+      '→': '\\rightarrow ', '←': '\\leftarrow ', '↑': '\\uparrow ', '↓': '\\downarrow ',
+      '∞': '\\infty ', '∂': '\\partial ', '∇': '\\nabla ', '∀': '\\forall ',
+      '∃': '\\exists ', '∅': '\\emptyset ',
+      'α': '\\alpha ', 'β': '\\beta ', 'γ': '\\gamma ', 'δ': '\\delta ',
+      'ε': '\\epsilon ', 'ζ': '\\zeta ', 'η': '\\eta ', 'θ': '\\theta ',
+      'ι': '\\iota ', 'κ': '\\kappa ', 'λ': '\\lambda ', 'μ': '\\mu ',
+      'ν': '\\nu ', 'ξ': '\\xi ', 'π': '\\pi ', 'ρ': '\\rho ',
+      'σ': '\\sigma ', 'τ': '\\tau ', 'υ': '\\upsilon ', 'φ': '\\phi ',
+      'χ': '\\chi ', 'ψ': '\\psi ', 'ω': '\\omega ',
+      'Γ': '\\Gamma ', 'Δ': '\\Delta ', 'Θ': '\\Theta ', 'Λ': '\\Lambda ',
+      'Ξ': '\\Xi ', 'Π': '\\Pi ', 'Σ': '\\Sigma ', 'Υ': '\\Upsilon ',
+      'Φ': '\\Phi ', 'Ψ': '\\Psi ', 'Ω': '\\Omega '
+    };
+    let mapped = '';
+    for (const char of text) {
+      mapped += symbolMap[char] || char;
+    }
+    return mapped;
+  }
+
+  return parseNodes(xmlSnippet).trim().replace(/\s+/g, ' ');
+}
+
+// 提取 docx 关系表 (rId -> target)
+function parseDocxRels(buf) {
+  const relsBuf = readZipEntry(buf, "word/_rels/document.xml.rels");
+  if (!relsBuf) return {};
+  const xml = relsBuf.toString("utf8");
+  const rels = {};
+  const relRegex = /<Relationship\s+([^>]+)\/>/gi;
+  let m;
+  while ((m = relRegex.exec(xml))) {
+    const attrs = m[1];
+    const idMatch = /Id="([^"]+)"/i.exec(attrs);
+    const targetMatch = /Target="([^"]+)"/i.exec(attrs);
+    const typeMatch = /Type="([^"]+)"/i.exec(attrs);
+    if (idMatch && targetMatch) {
+      const id = idMatch[1];
+      let target = targetMatch[1].replace(/\\/g, "/");
+      if (!target.startsWith("word/") && !target.startsWith("/")) {
+        target = "word/" + target;
+      } else if (target.startsWith("/")) {
+        target = target.slice(1);
+      }
+      rels[id] = {
+        target,
+        type: typeMatch ? typeMatch[1] : ""
+      };
+    }
+  }
+  return rels;
+}
+
+function getMimeType(filePath) {
+  const ext = (filePath.split(".").pop() || "").toLowerCase();
+  switch (ext) {
+    case "png": return "image/png";
+    case "jpg":
+    case "jpeg": return "image/jpeg";
+    case "gif": return "image/gif";
+    case "webp": return "image/webp";
+    case "svg": return "image/svg+xml";
+    case "bmp": return "image/bmp";
+    default: return "application/octet-stream";
+  }
+}
+
+/** 从 OOXML .docx 抽取出富文本块序列（标题、段落、公式、图片、表格） */
+function extractDocxRichDocument(buf) {
+  if (!buf || !Buffer.isBuffer(buf) || buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+    const err = new Error("不是有效的 .docx");
+    err.code = "INVALID_DOCX";
+    throw err;
+  }
+  const xmlBuf = readZipEntry(buf, "word/document.xml");
+  if (!xmlBuf) {
+    const err = new Error("不是有效的 .docx（缺少 word/document.xml）");
+    err.code = "INVALID_DOCX";
+    throw err;
+  }
+  const rels = parseDocxRels(buf);
+  const xml = xmlBuf.toString("utf8");
+
+  // 提取全部内置图片
+  const imagesMap = {};
+  let imagesCount = 0;
+  for (const [rId, rel] of Object.entries(rels)) {
+    if (rel.type && rel.type.includes("/image")) {
+      const imgBuf = readZipEntry(buf, rel.target);
+      if (imgBuf) {
+        const mime = getMimeType(rel.target);
+        imagesMap[rId] = {
+          id: rId,
+          name: path.basename(rel.target),
+          dataUrl: `data:${mime};base64,${imgBuf.toString("base64")}`,
+          alt: path.basename(rel.target)
+        };
+        imagesCount++;
+      }
+    }
+  }
+
+  const blocks = [];
+  let mathCount = 0;
+  let docTitle = "";
+
+  function parseParagraphRuns(pXml) {
+    const runs = [];
+    const runRegex = /(<m:oMath>[\s\S]*?<\/m:oMath>|<w:r(?:\s[^>]*)?>[\s\S]*?<\/w:r>)/g;
+    let m;
+    while ((m = runRegex.exec(pXml))) {
+      const chunk = m[1];
+      if (chunk.startsWith("<m:oMath>")) {
+        const latex = ommlToLatex(chunk);
+        if (latex) {
+          runs.push({ type: "math", text: latex });
+          mathCount++;
+        }
+      } else {
+        const isBold = /<w:b(?:\s[^>]*)?\/>/.test(chunk);
+        const isItalic = /<w:i(?:\s[^>]*)?\/>/.test(chunk);
+        const bits = [];
+        const tRegex = /<w:tab\s*\/>|<w:br\s*\/>|<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+        let tm;
+        while ((tm = tRegex.exec(chunk))) {
+          if (tm[0].startsWith("<w:tab")) bits.push("\t");
+          else if (tm[0].startsWith("<w:br")) bits.push("\n");
+          else if (tm[1]) bits.push(decodeXmlText(tm[1]));
+        }
+        const text = bits.join("");
+        if (text) {
+          runs.push({
+            type: isBold ? "bold" : isItalic ? "italic" : "text",
+            text
+          });
+        }
+      }
+    }
+    return runs;
+  }
+
+  const blockRegex = /(<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>|<w:tbl(?:\s[^>]*)?>[\s\S]*?<\/w:tbl>)/g;
+  let bm;
+  while ((bm = blockRegex.exec(xml))) {
+    const chunk = bm[1];
+    if (chunk.startsWith("<w:tbl")) {
+      const tableData = [];
+      const rowRegex = /<w:tr(?:\s[^>]*)?>([\s\S]*?)<\/w:tr>/g;
+      let rm;
+      while ((rm = rowRegex.exec(chunk))) {
+        const rowXml = rm[1];
+        const cells = [];
+        const cellRegex = /<w:tc(?:\s[^>]*)?>([\s\S]*?)<\/w:tc>/g;
+        let cm;
+        while ((cm = cellRegex.exec(rowXml))) {
+          const cellXml = cm[1];
+          const cBits = [];
+          const ctRegex = /<w:t(?:\s[^>]*)?>([^<]*)<\/w:t>/g;
+          let ctm;
+          while ((ctm = ctRegex.exec(cellXml))) {
+            if (ctm[1]) cBits.push(decodeXmlText(ctm[1]));
+          }
+          cells.push(cBits.join(" ").trim());
+        }
+        if (cells.length) tableData.push(cells);
+      }
+      if (tableData.length) {
+        blocks.push({ type: "table", tableData });
+      }
+    } else {
+      // 段落 <w:p>
+      const imgEmbedMatch = /<[a-zA-Z0-9:]*blip[^>]*r:embed="([^"]+)"|<[a-zA-Z0-9:]*imagedata[^>]*r:id="([^"]+)"/i.exec(chunk);
+      if (imgEmbedMatch) {
+        const rId = imgEmbedMatch[1] || imgEmbedMatch[2];
+        if (imagesMap[rId]) {
+          blocks.push({
+            type: "image",
+            image: imagesMap[rId]
+          });
+        }
+      }
+
+      if (chunk.includes("<m:oMathPara>")) {
+        const mathParaMatch = /<m:oMathPara>([\s\S]*?)<\/m:oMathPara>/g;
+        let mpm;
+        while ((mpm = mathParaMatch.exec(chunk))) {
+          const latex = ommlToLatex(mpm[1]);
+          if (latex) {
+            blocks.push({
+              type: "math-block",
+              latex
+            });
+            mathCount++;
+          }
+        }
+        continue;
+      }
+
+      let headingLevel = 0;
+      const pStyleMatch = /<w:pStyle\s+[^>]*w:val="([^"]+)"/i.exec(chunk);
+      if (pStyleMatch) {
+        const styleVal = pStyleMatch[1].toLowerCase();
+        if (styleVal.includes("heading1") || styleVal === "1" || styleVal === "title") headingLevel = 1;
+        else if (styleVal.includes("heading2") || styleVal === "2" || styleVal === "subtitle") headingLevel = 2;
+        else if (styleVal.includes("heading3") || styleVal === "3") headingLevel = 3;
+      }
+
+      const runs = parseParagraphRuns(chunk);
+      const text = runs.map((r) => r.text).join("");
+
+      if (!docTitle && headingLevel === 1 && text.trim()) {
+        docTitle = text.trim();
+      }
+
+      if (runs.length > 0 && text.trim()) {
+        if (headingLevel > 0) {
+          blocks.push({
+            type: "heading",
+            level: headingLevel,
+            text,
+            runs
+          });
+        } else {
+          blocks.push({
+            type: "paragraph",
+            text,
+            runs
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    title: docTitle,
+    blocks,
+    imagesCount,
+    mathCount
+  };
+}
+
+/** 从 OOXML .docx 抽出段落纯文本（保留转译后的 LaTeX 公式给大模型） */
 function extractDocxPlainText(buf) {
   const xmlBuf = readZipEntry(buf, "word/document.xml");
   if (!xmlBuf) {
@@ -76,7 +548,19 @@ function extractDocxPlainText(buf) {
     err.code = "INVALID_DOCX";
     throw err;
   }
-  const xml = xmlBuf.toString("utf8");
+  let xml = xmlBuf.toString("utf8");
+
+  // 将 OMML 公式替换为标准 LaTeX 文本，注入给大模型
+  xml = xml
+    .replace(/<m:oMathPara(?:\s[^>]*)?>([\s\S]*?)<\/m:oMathPara>/g, (_m, p) => {
+      const latex = ommlToLatex(p);
+      return latex ? `<w:t> \n$$ ${latex} $$\n </w:t>` : "";
+    })
+    .replace(/<m:oMath(?:\s[^>]*)?>([\s\S]*?)<\/m:oMath>/g, (_m, p) => {
+      const latex = ommlToLatex(p);
+      return latex ? `<w:t> $${latex}$ </w:t>` : "";
+    });
+
   const paras = [];
   for (const chunk of xml.split(/<\/w:p>/)) {
     const bits = [];
@@ -2696,6 +3180,162 @@ ipcMain.handle("extract-pdf-text", async (_event, payload = {}) => {
       ok: false,
       code: err.code || "PDF_EXTRACT_FAILED",
       error: err.message || "抽取 PDF 正文失败"
+    };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 富文本文档与媒体读取通道 (Word 图文公式 / PDF Canvas)
+// ---------------------------------------------------------------------------
+ipcMain.handle("read-rich-document", async (_event, payload) => {
+  const relativePath = typeof payload === "string" ? payload : payload?.relativePath;
+  if (!relativePath || typeof relativePath !== "string") {
+    return {
+      ok: false,
+      code: "INVALID_ARGUMENT",
+      reason: "文件相对路径不能为空",
+      hint: "请指定有效的文档路径"
+    };
+  }
+
+  const mode = SecuritySandbox.permissionMode;
+  const workspace = SecuritySandbox.activeWorkspaceDir;
+
+  if (mode === "chat-only") {
+    SecuritySandbox.logAudit("BLOCKED_READ_CHAT_ONLY", relativePath);
+    return {
+      ok: false,
+      code: "CHAT_ONLY_BLOCKED",
+      reason: "当前处于【纯对话咨询】模式，已强制阻断本地任何文件读取操作以保护隐私",
+      hint: "如需分析项目代码与文档，请在输入框左侧将权限模式切换为【工作区只读】或【工作区读写】"
+    };
+  }
+
+  let candidatePath = "";
+
+  if (mode === "workspace-readonly" || mode === "workspace-readwrite") {
+    if (!workspace) {
+      return {
+        ok: false,
+        code: "NO_WORKSPACE",
+        reason: "当前尚未选定工作区工程目录",
+        hint: "请在左侧栏点击选择或切换工作区目录"
+      };
+    }
+
+    candidatePath = path.resolve(workspace, relativePath);
+
+    if (!fs.existsSync(candidatePath)) {
+      return {
+        ok: false,
+        code: "NOT_FOUND",
+        reason: `文件不存在: ${relativePath}`,
+        hint: "请检查相对路径拼写是否正确"
+      };
+    }
+
+    try {
+      const realWorkspace = fs.realpathSync(workspace);
+      const realTarget = fs.realpathSync(candidatePath);
+      const rel = path.relative(realWorkspace, realTarget);
+      const isContained = !rel.startsWith("..") && !path.isAbsolute(rel);
+
+      if (!isContained) {
+        SecuritySandbox.logAudit("BLOCKED_SYMLINK_OR_TRAVERSAL", candidatePath);
+        return {
+          ok: false,
+          code: "PERMISSION_DENIED",
+          reason: "目标文件指向工作区外部物理路径 (软链接逃逸或越权穿透已拦截)",
+          hint: "当前受安全沙箱保护，严禁访问工作区外部物理文件"
+        };
+      }
+      candidatePath = realTarget;
+    } catch (err) {
+      return {
+        ok: false,
+        code: "REALPATH_ERROR",
+        reason: `解析文件物理路径失败: ${err.message}`,
+        hint: "文件可能为损坏的无效链接"
+      };
+    }
+  } else {
+    // full-access
+    candidatePath = workspace ? path.resolve(workspace, relativePath) : path.resolve(relativePath);
+    if (!fs.existsSync(candidatePath)) {
+      return {
+        ok: false,
+        code: "NOT_FOUND",
+        reason: `文件不存在: ${relativePath}`,
+        hint: "请检查路径拼写是否正确"
+      };
+    }
+    try {
+      candidatePath = fs.realpathSync(candidatePath);
+    } catch {}
+  }
+
+  try {
+    const stat = fs.statSync(candidatePath);
+    if (stat.isDirectory()) {
+      return {
+        ok: false,
+        code: "IS_DIRECTORY",
+        reason: `指定路径为目录而非文档: ${relativePath}`,
+        hint: "请指定具体的 .docx 或 .pdf 文件"
+      };
+    }
+
+    if (/\.docx$/i.test(candidatePath)) {
+      if (stat.size > MAX_DOCX_SOURCE_BYTES) {
+        return {
+          ok: false,
+          code: "FILE_TOO_LARGE",
+          reason: "docx 超过 8MB，请先另存精简后再预览",
+          hint: "超出文件大小上限"
+        };
+      }
+      const richDoc = extractDocxRichDocument(fs.readFileSync(candidatePath));
+      return {
+        ok: true,
+        type: "docx",
+        relativePath,
+        fullPath: candidatePath,
+        richDocument: richDoc,
+        totalBytes: stat.size
+      };
+    }
+
+    if (/\.pdf$/i.test(candidatePath)) {
+      if (stat.size > MAX_PDF_SOURCE_BYTES) {
+        return {
+          ok: false,
+          code: "FILE_TOO_LARGE",
+          reason: "PDF 超过 8MB，请先另存精简后再预览",
+          hint: "超出文件大小上限"
+        };
+      }
+      const fileBuffer = fs.readFileSync(candidatePath);
+      return {
+        ok: true,
+        type: "pdf",
+        relativePath,
+        fullPath: candidatePath,
+        base64: fileBuffer.toString("base64"),
+        totalBytes: stat.size
+      };
+    }
+
+    return {
+      ok: false,
+      code: "UNSUPPORTED_TYPE",
+      reason: "仅支持查看 .docx 与 .pdf 富文本文档",
+      hint: "如需查看其他代码或文本，请使用常规源码视图"
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      code: "RICH_DOC_ERROR",
+      reason: err.message || "读取富文档失败"
     };
   }
 });

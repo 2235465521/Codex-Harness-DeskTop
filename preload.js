@@ -205,6 +205,7 @@ contextBridge.exposeInMainWorld("codexDesktop", {
   readWorkspaceFile: (relativePath) => ipcRenderer.invoke("read-workspace-file", { relativePath }),
   extractDocxText: (payload) => ipcRenderer.invoke("extract-docx-text", payload),
   extractPdfText: (payload) => ipcRenderer.invoke("extract-pdf-text", payload),
+  readRichDocument: (relativePath) => ipcRenderer.invoke("read-rich-document", { relativePath }),
   writeWorkspaceFile: (payload) => ipcRenderer.invoke("write-workspace-file", payload),
   readWorkspaceFileDiff: (relativePath) => ipcRenderer.invoke("read-workspace-file-diff", { relativePath }),
   revertWorkspaceFile: (relativePath) => ipcRenderer.invoke("revert-workspace-file", { relativePath }),

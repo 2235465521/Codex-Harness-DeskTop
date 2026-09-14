@@ -323,6 +323,7 @@ export const App: React.FC = () => {
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [inputPrompt, setInputPrompt] = useState('');
+  const [composerImages, setComposerImages] = useState<AttachedImage[]>([]);
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [skillsTabSignal, setSkillsTabSignal] = useState(0);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('workspace-readonly');
@@ -1542,10 +1543,12 @@ export const App: React.FC = () => {
             permissionMode={permissionMode}
             onSelectPermissionMode={handleSelectPermissionMode}
             currentSessionId={currentSessionId}
+            attachedImages={composerImages}
+            onImagesChange={setComposerImages}
           />
         </main>
 
-        {/* 右侧变更预览面板 (支持源码/Diff双模式与一键还原) */}
+        {/* 右侧变更预览面板 (支持阅读/源码/Diff多模式与一键还原) */}
         <PreviewPanel
           isOpen={isPreviewOpen}
           onClose={() => setIsPreviewOpen(false)}
@@ -1555,6 +1558,12 @@ export const App: React.FC = () => {
           originalContent={previewFile?.originalContent}
           hasBackup={previewFile?.hasBackup}
           onRevert={handleRevertFile}
+          onAttachImage={(img) => {
+            setComposerImages((prev) => [
+              ...prev,
+              { base64: img.dataUrl, path: img.name },
+            ]);
+          }}
           onInsertToPrompt={(text) => {
             const formatted = text.endsWith(' ') ? text : `${text} `;
             setInputPrompt(prev => {

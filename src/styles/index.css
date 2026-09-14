@@ -17,6 +17,18 @@ code, pre, kbd, samp {
   font-size: var(--font-code-size, 12px) !important;
 }
 
+.katex {
+  color: inherit !important;
+  font-size: 1.05em;
+}
+
+.katex-display {
+  margin: 0.75em 0 !important;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25em 0;
+}
+
 /* ═══════════════════════════════════════════════════════════
    4 套 escook-theme 官方正统美学主题 CSS 变量系统
    (100% 对齐 liulongbin1314.escook-theme 原生调色哲学)

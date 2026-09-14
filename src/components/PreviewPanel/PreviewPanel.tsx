@@ -1,5 +1,8 @@
-import React, { useState, useMemo } from 'react';
-import { X, Layers, Code, Copy, Check, CornerDownLeft, GitCompare, RotateCcw, Plus, Minus } from 'lucide-react';
+import React, { useState, useMemo, useEffect } from 'react';
+import { X, Layers, Code, Copy, Check, CornerDownLeft, GitCompare, RotateCcw, BookOpen, Loader2, Maximize2 } from 'lucide-react';
+import { ReadRichDocumentResult } from '../../types/electron';
+import { DocxReader } from './DocxReader';
+import { PdfReader } from './PdfReader';
 
 export interface PreviewPanelProps {
   isOpen: boolean;
@@ -11,6 +14,7 @@ export interface PreviewPanelProps {
   hasBackup?: boolean;
   onRevert?: (filePath: string) => Promise<void>;
   onInsertToPrompt?: (text: string) => void;
+  onAttachImage?: (img: { id: string; name: string; dataUrl: string }) => void;
 }
 
 interface DiffLine {
@@ -27,7 +31,6 @@ function computeLineDiff(oldText: string, newText: string): { lines: DiffLine[];
   const n = oldLines.length;
   const m = newLines.length;
 
-  // 保护性截断（行数过大时退化为快速比对，防止 UI 卡顿）
   if (n * m > 250000) {
     const lines: DiffLine[] = [];
     let added = 0;
@@ -113,10 +116,49 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
   hasBackup = false,
   onRevert,
   onInsertToPrompt,
+  onAttachImage,
 }) => {
   const [copied, setCopied] = useState(false);
-  const [viewMode, setViewMode] = useState<'code' | 'diff'>('code');
+  const [viewMode, setViewMode] = useState<'reading' | 'code' | 'diff'>('code');
   const [isReverting, setIsReverting] = useState(false);
+  const [richLoading, setRichLoading] = useState(false);
+  const [richDocData, setRichDocData] = useState<ReadRichDocumentResult | null>(null);
+  const [lightboxImg, setLightboxImg] = useState<{ src: string; name?: string } | null>(null);
+
+  const isRichDoc = useMemo(() => {
+    return !!filePath && /\.(docx|pdf)$/i.test(filePath);
+  }, [filePath]);
+
+  // 当选定文件变更时，自动判断是否加载富文档
+  useEffect(() => {
+    if (!isOpen || !filePath) {
+      setRichDocData(null);
+      return;
+    }
+
+    if (isRichDoc && window.codexDesktop?.readRichDocument) {
+      setRichLoading(true);
+      setViewMode('reading');
+      window.codexDesktop.readRichDocument(filePath)
+        .then((res) => {
+          if (res?.ok) {
+            setRichDocData(res);
+          } else {
+            setRichDocData(null);
+          }
+        })
+        .catch((err) => {
+          console.error('[PreviewPanel] 加载富文档异常:', err);
+          setRichDocData(null);
+        })
+        .finally(() => {
+          setRichLoading(false);
+        });
+    } else {
+      setRichDocData(null);
+      setViewMode('code');
+    }
+  }, [isOpen, filePath, isRichDoc]);
 
   // 当备份存在时，自动提供 Diff 视角
   const diffResult = useMemo(() => {
@@ -153,198 +195,275 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
   const ext = (filePath || title).split('.').pop()?.toUpperCase() || 'CODE';
 
   return (
-    <aside className={`h-full bg-bg-sidebar border-l border-border flex flex-col flex-shrink-0 animate-slideLeft z-20 select-none shadow-xl transition-all duration-200 ${
-      viewMode === 'diff' ? 'w-96 sm:w-[500px]' : 'w-88 sm:w-96'
-    }`}>
-      {/* 头部导航与模式切换 */}
-      <div className="h-13 px-4 border-b border-border flex items-center justify-between">
-        <div className="flex items-center gap-2 text-xs font-bold text-text-primary">
-          <Layers size={15} className="text-accent" />
-          <span>代码审查与对比</span>
-        </div>
-
-        {/* 模式切换胶囊 */}
-        <div className="flex items-center gap-1 bg-bg-base/80 p-0.5 rounded-lg border border-border">
-          <button
-            type="button"
-            onClick={() => setViewMode('code')}
-            className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-all ${
-              viewMode === 'code'
-                ? 'bg-accent text-white shadow-xs'
-                : 'text-text-muted hover:text-text-primary'
-            }`}
-            title="查看最新完整源码"
-          >
-            <Code size={12} />
-            <span>源码</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('diff')}
-            className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-all ${
-              viewMode === 'diff'
-                ? 'bg-accent text-white shadow-xs'
-                : 'text-text-muted hover:text-text-primary'
-            }`}
-            title={hasBackup ? '查看修改前后差异对比 (Diff)' : '当前无历史备份'}
-          >
-            <GitCompare size={12} />
-            <span>差异</span>
-            {hasBackup && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            )}
-          </button>
-        </div>
-
-        {/* 操作区 */}
-        <div className="flex items-center gap-1">
-          {codeContent && (
-            <button
-              onClick={handleCopy}
-              className="p-1.5 text-text-muted hover:text-text-primary hover:bg-bg-hover rounded-md transition-colors"
-              title="复制全部源码"
-            >
-              {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
-            </button>
-          )}
-          <button
-            onClick={onClose}
-            className="p-1.5 text-text-muted hover:text-text-primary hover:bg-bg-hover rounded-md transition-colors"
-            title="关闭面板"
-          >
-            <X size={15} />
-          </button>
-        </div>
-      </div>
-
-      {/* 内容主体 */}
-      <div className="flex-1 overflow-y-auto p-3.5 space-y-3">
-        <div className="bg-bg-card border border-border rounded-xl overflow-hidden shadow-xs">
-          {/* 文件信息栏与还原按钮 */}
-          <div className="px-3 py-2 bg-bg-sidebar border-b border-border flex items-center justify-between text-[11px]">
-            <div className="flex items-center gap-2 min-w-0 flex-1 pr-2">
-              <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent font-bold text-[10px] font-mono">
-                {ext}
-              </span>
-              <span className="font-mono text-text-primary font-medium truncate" title={filePath || title}>
-                {title}
-              </span>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0">
-              {/* 差异统计 */}
-              {viewMode === 'diff' && diffResult && (
-                <div className="flex items-center gap-1.5 font-mono text-[10px]">
-                  <span className="text-emerald-400 font-bold">+{diffResult.addedCount}</span>
-                  <span className="text-rose-400 font-bold">-{diffResult.removedCount}</span>
-                </div>
-              )}
-
-              {/* 还原按钮 */}
-              {hasBackup && onRevert && filePath && (
-                <button
-                  type="button"
-                  onClick={handleRevertClick}
-                  disabled={isReverting}
-                  className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 text-[10px] font-medium transition-colors cursor-pointer"
-                  title="撤销当前修改，安全还原为修改前的副本"
-                >
-                  <RotateCcw size={10} className={isReverting ? 'animate-spin' : ''} />
-                  <span>{isReverting ? '还原中...' : '还原'}</span>
-                </button>
-              )}
-
-              {viewMode === 'code' && (
-                <span className="text-[10px] text-text-muted font-mono">
-                  {lineCount} 行
-                </span>
-              )}
-            </div>
+    <>
+      <aside className={`h-full bg-bg-sidebar border-l border-border flex flex-col flex-shrink-0 animate-slideLeft z-20 select-none shadow-xl transition-all duration-200 ${
+        viewMode === 'diff' ? 'w-96 sm:w-[520px]' : viewMode === 'reading' ? 'w-96 sm:w-[500px] lg:w-[560px]' : 'w-88 sm:w-96'
+      }`}>
+        {/* 头部导航与模式切换 */}
+        <div className="h-13 px-4 border-b border-border flex items-center justify-between">
+          <div className="flex items-center gap-2 text-xs font-bold text-text-primary">
+            <Layers size={15} className="text-accent" />
+            <span>文档审阅与对比</span>
           </div>
 
-          {/* 快捷操作条 */}
-          {filePath && onInsertToPrompt && (
-            <div className="px-3 py-1.5 bg-bg-card/80 border-b border-border-light flex items-center justify-between text-[11px]">
-              <span className="text-text-muted text-[10px] truncate max-w-[200px]" title={filePath}>
-                {filePath}
-              </span>
+          {/* 模式切换胶囊 */}
+          <div className="flex items-center gap-1 bg-bg-base/80 p-0.5 rounded-lg border border-border">
+            {isRichDoc && (
               <button
                 type="button"
-                onClick={() => {
-                  const fileRef = filePath.includes(' ') ? `@"${filePath}"` : `@${filePath}`;
-                  onInsertToPrompt(`${fileRef} `);
-                }}
-                className="flex items-center gap-1 text-[10px] text-accent hover:underline cursor-pointer shrink-0"
-                title="在当前输入框中引用该文件"
+                onClick={() => setViewMode('reading')}
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-all ${
+                  viewMode === 'reading'
+                    ? 'bg-accent text-white shadow-xs'
+                    : 'text-text-muted hover:text-text-primary'
+                }`}
+                title="阅读富排版视图 (公式/图片/表格/Canvas)"
               >
-                <CornerDownLeft size={10} />
-                <span>引用至对话</span>
+                <BookOpen size={12} />
+                <span>阅读</span>
               </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setViewMode('code')}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-all ${
+                viewMode === 'code'
+                  ? 'bg-accent text-white shadow-xs'
+                  : 'text-text-muted hover:text-text-primary'
+              }`}
+              title="查看文本/源码"
+            >
+              <Code size={12} />
+              <span>{isRichDoc ? '纯文本' : '源码'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('diff')}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-all ${
+                viewMode === 'diff'
+                  ? 'bg-accent text-white shadow-xs'
+                  : 'text-text-muted hover:text-text-primary'
+              }`}
+              title={hasBackup ? '查看修改前后差异对比 (Diff)' : '当前无历史备份'}
+            >
+              <GitCompare size={12} />
+              <span>差异</span>
+              {hasBackup && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              )}
+            </button>
+          </div>
+
+          {/* 操作区 */}
+          <div className="flex items-center gap-1">
+            {codeContent && (
+              <button
+                onClick={handleCopy}
+                className="p-1.5 text-text-muted hover:text-text-primary hover:bg-bg-hover rounded-md transition-colors"
+                title="复制文本"
+              >
+                {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              className="p-1.5 text-text-muted hover:text-text-primary hover:bg-bg-hover rounded-md transition-colors"
+              title="关闭面板"
+            >
+              <X size={15} />
+            </button>
+          </div>
+        </div>
+
+        {/* 内容主体 */}
+        <div className="flex-1 overflow-y-auto p-3.5 space-y-3">
+          <div className="bg-bg-card border border-border rounded-xl overflow-hidden shadow-xs">
+            {/* 文件信息栏与还原按钮 */}
+            <div className="px-3 py-2 bg-bg-sidebar border-b border-border flex items-center justify-between text-[11px]">
+              <div className="flex items-center gap-2 min-w-0 flex-1 pr-2">
+                <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent font-bold text-[10px] font-mono">
+                  {ext}
+                </span>
+                <span className="font-mono text-text-primary font-medium truncate" title={filePath || title}>
+                  {title}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {/* 差异统计 */}
+                {viewMode === 'diff' && diffResult && (
+                  <div className="flex items-center gap-1.5 font-mono text-[10px]">
+                    <span className="text-emerald-400 font-bold">+{diffResult.addedCount}</span>
+                    <span className="text-rose-400 font-bold">-{diffResult.removedCount}</span>
+                  </div>
+                )}
+
+                {/* 还原按钮 */}
+                {hasBackup && onRevert && filePath && (
+                  <button
+                    type="button"
+                    onClick={handleRevertClick}
+                    disabled={isReverting}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 text-[10px] font-medium transition-colors cursor-pointer"
+                    title="撤销当前修改，安全还原为修改前的副本"
+                  >
+                    <RotateCcw size={10} className={isReverting ? 'animate-spin' : ''} />
+                    <span>{isReverting ? '还原中...' : '还原'}</span>
+                  </button>
+                )}
+
+                {viewMode === 'code' && (
+                  <span className="text-[10px] text-text-muted font-mono">
+                    {lineCount} 行
+                  </span>
+                )}
+              </div>
             </div>
-          )}
 
-          {/* 源码视图 */}
-          {viewMode === 'code' && (
-            <pre className="p-3 font-mono text-text-secondary text-[11px] leading-relaxed overflow-x-auto whitespace-pre-wrap bg-bg-base/60 select-text max-h-[calc(100vh-240px)]">
-              <code>{codeContent}</code>
-            </pre>
-          )}
+            {/* 快捷操作条 */}
+            {filePath && onInsertToPrompt && (
+              <div className="px-3 py-1.5 bg-bg-card/80 border-b border-border-light flex items-center justify-between text-[11px]">
+                <span className="text-text-muted text-[10px] truncate max-w-[200px]" title={filePath}>
+                  {filePath}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const fileRef = filePath.includes(' ') ? `@"${filePath}"` : `@${filePath}`;
+                    onInsertToPrompt(`${fileRef} `);
+                  }}
+                  className="flex items-center gap-1 text-[10px] text-accent hover:underline cursor-pointer shrink-0"
+                  title="在当前输入框中引用该文件"
+                >
+                  <CornerDownLeft size={10} />
+                  <span>引用至对话</span>
+                </button>
+              </div>
+            )}
 
-          {/* 差异 (Diff) 视图 */}
-          {viewMode === 'diff' && (
-            <div className="font-mono text-[11px] leading-relaxed bg-bg-base/60 select-text max-h-[calc(100vh-240px)] overflow-x-auto overflow-y-auto">
-              {!hasBackup || !diffResult ? (
-                <div className="p-6 text-center text-text-muted text-xs">
-                  <p>当前文件暂无历史修改记录或属于新创建文件。</p>
-                  <p className="text-[10px] mt-1 text-text-muted/70">当大模型修改已有文件时，系统会自动生成对比并支持还原。</p>
-                </div>
-              ) : (
-                <div className="divide-y divide-border/20 py-1">
-                  {diffResult.lines.map((dl, idx) => {
-                    if (dl.type === 'added') {
+            {/* 1. 阅读模式 */}
+            {viewMode === 'reading' && (
+              <div className="min-h-[300px]">
+                {richLoading ? (
+                  <div className="flex flex-col items-center justify-center p-12 text-text-muted space-y-2">
+                    <Loader2 size={22} className="animate-spin text-accent" />
+                    <span className="text-xs">正在解析文档图文与数学公式...</span>
+                  </div>
+                ) : richDocData?.type === 'docx' && richDocData.richDocument ? (
+                  <DocxReader
+                    document={richDocData.richDocument}
+                    onAttachImage={onAttachImage}
+                    onOpenLightbox={(src, name) => setLightboxImg({ src, name })}
+                  />
+                ) : richDocData?.type === 'pdf' && richDocData.base64 ? (
+                  <PdfReader base64Data={richDocData.base64} />
+                ) : (
+                  <div className="p-8 text-center text-text-muted text-xs space-y-2">
+                    <p>未能以富排版模式加载该文档，建议切换到纯文本模式查看。</p>
+                    <button
+                      type="button"
+                      onClick={() => setViewMode('code')}
+                      className="px-2 py-1 rounded bg-accent/15 text-accent text-xs hover:bg-accent hover:text-white transition-colors cursor-pointer"
+                    >
+                      切换至纯文本查看
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 2. 源码 / 纯文本视图 */}
+            {viewMode === 'code' && (
+              <pre className="p-3 font-mono text-text-secondary text-[11px] leading-relaxed overflow-x-auto whitespace-pre-wrap bg-bg-base/60 select-text max-h-[calc(100vh-240px)]">
+                <code>{codeContent}</code>
+              </pre>
+            )}
+
+            {/* 3. 差异 (Diff) 视图 */}
+            {viewMode === 'diff' && (
+              <div className="font-mono text-[11px] leading-relaxed bg-bg-base/60 select-text max-h-[calc(100vh-240px)] overflow-x-auto overflow-y-auto">
+                {!hasBackup || !diffResult ? (
+                  <div className="p-6 text-center text-text-muted text-xs">
+                    <p>当前文件暂无历史修改记录或属于新创建文件。</p>
+                    <p className="text-[10px] mt-1 text-text-muted/70">当大模型修改已有文件时，系统会自动生成对比并支持还原。</p>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-border/20 py-1">
+                    {diffResult.lines.map((dl, idx) => {
+                      if (dl.type === 'added') {
+                        return (
+                          <div key={idx} className="flex items-start bg-emerald-500/15 text-emerald-300 px-2 py-0.5 hover:bg-emerald-500/20">
+                            <span className="w-8 text-right pr-2 text-emerald-500/60 select-none text-[10px] shrink-0 font-mono">
+                              {dl.newLineNumber}
+                            </span>
+                            <span className="w-4 text-center text-emerald-400 select-none shrink-0 font-bold">
+                              +
+                            </span>
+                            <span className="whitespace-pre-wrap break-all flex-1">{dl.text || ' '}</span>
+                          </div>
+                        );
+                      }
+                      if (dl.type === 'removed') {
+                        return (
+                          <div key={idx} className="flex items-start bg-rose-500/15 text-rose-300 px-2 py-0.5 hover:bg-rose-500/20">
+                            <span className="w-8 text-right pr-2 text-rose-500/60 select-none text-[10px] shrink-0 font-mono">
+                              {dl.oldLineNumber}
+                            </span>
+                            <span className="w-4 text-center text-rose-400 select-none shrink-0 font-bold">
+                              -
+                            </span>
+                            <span className="whitespace-pre-wrap break-all flex-1">{dl.text || ' '}</span>
+                          </div>
+                        );
+                      }
                       return (
-                        <div key={idx} className="flex items-start bg-emerald-500/15 text-emerald-300 px-2 py-0.5 hover:bg-emerald-500/20">
-                          <span className="w-8 text-right pr-2 text-emerald-500/60 select-none text-[10px] shrink-0 font-mono">
+                        <div key={idx} className="flex items-start text-text-secondary px-2 py-0.5 hover:bg-bg-hover/30">
+                          <span className="w-8 text-right pr-2 text-text-muted/40 select-none text-[10px] shrink-0 font-mono">
                             {dl.newLineNumber}
                           </span>
-                          <span className="w-4 text-center text-emerald-400 select-none shrink-0 font-bold">
-                            +
+                          <span className="w-4 text-center text-transparent select-none shrink-0">
+                            {' '}
                           </span>
                           <span className="whitespace-pre-wrap break-all flex-1">{dl.text || ' '}</span>
                         </div>
                       );
-                    }
-                    if (dl.type === 'removed') {
-                      return (
-                        <div key={idx} className="flex items-start bg-rose-500/15 text-rose-300 px-2 py-0.5 hover:bg-rose-500/20">
-                          <span className="w-8 text-right pr-2 text-rose-500/60 select-none text-[10px] shrink-0 font-mono">
-                            {dl.oldLineNumber}
-                          </span>
-                          <span className="w-4 text-center text-rose-400 select-none shrink-0 font-bold">
-                            -
-                          </span>
-                          <span className="whitespace-pre-wrap break-all flex-1">{dl.text || ' '}</span>
-                        </div>
-                      );
-                    }
-                    return (
-                      <div key={idx} className="flex items-start text-text-secondary px-2 py-0.5 hover:bg-bg-hover/30">
-                        <span className="w-8 text-right pr-2 text-text-muted/40 select-none text-[10px] shrink-0 font-mono">
-                          {dl.newLineNumber}
-                        </span>
-                        <span className="w-4 text-center text-transparent select-none shrink-0">
-                          {' '}
-                        </span>
-                        <span className="whitespace-pre-wrap break-all flex-1">{dl.text || ' '}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
-    </aside>
+      </aside>
+
+      {/* 高清图片 Lightbox 浮层 */}
+      {lightboxImg && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 animate-fadeIn"
+          onClick={() => setLightboxImg(null)}
+        >
+          <div className="relative max-w-4xl max-h-[90vh] flex flex-col items-center" onClick={(e) => e.stopPropagation()}>
+            <button
+              type="button"
+              onClick={() => setLightboxImg(null)}
+              className="absolute -top-10 right-0 p-1.5 text-white/70 hover:text-white bg-white/10 hover:bg-white/20 rounded-full transition-colors cursor-pointer"
+              title="关闭"
+            >
+              <X size={18} />
+            </button>
+            <img
+              src={lightboxImg.src}
+              alt={lightboxImg.name || '大图'}
+              className="max-h-[80vh] max-w-full rounded-lg shadow-2xl object-contain"
+            />
+            {lightboxImg.name && (
+              <div className="mt-2 text-xs font-mono text-white/80 select-text">
+                {lightboxImg.name}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 };

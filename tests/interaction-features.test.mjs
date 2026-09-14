@@ -235,6 +235,79 @@ export async function runInteractionFeaturesTests() {
     const resEmail = handleAtMentionDeletion(email, email.length, 'Backspace');
     assert.strictEqual(resEmail, null, "邮箱地址严禁被误判为 @ 引用");
   });
+
+  // ══════════════════════════════════════════════════════════════
+  // Seam 19: 文档多模态与数学公式引擎 (Rich Document Pipeline)
+  // ══════════════════════════════════════════════════════════════
+  test("main.js: OMML 转译与富文档解构 (ommlToLatex, extractDocxRichDocument, read-rich-document)", () => {
+    const mainJs = fs.readFileSync(path.join(rootDir, "main.js"), "utf8");
+    assert.ok(mainJs.includes("ommlToLatex"), "main.js 必须包含 ommlToLatex 原生转译函数");
+    assert.ok(mainJs.includes("extractDocxRichDocument"), "main.js 必须包含 extractDocxRichDocument 结构化解包函数");
+    assert.ok(mainJs.includes("read-rich-document"), "main.js 必须注册 read-rich-document IPC 通道");
+
+    // 动态验证 ommlToLatex 转译准确性
+    const ctx = { decodeXmlText: (s) => s };
+    const extractOmmlCode = mainJs.slice(mainJs.indexOf("function extractTag"), mainJs.indexOf("function parseDocxRels"));
+    vm.createContext(ctx);
+    vm.runInContext(extractOmmlCode, ctx);
+    const { ommlToLatex } = ctx;
+
+    // 分数测试
+    const fracXml = '<m:oMath><m:f><m:num><m:r><m:t>a+b</m:t></m:r></m:num><m:den><m:r><m:t>c-d</m:t></m:r></m:den></m:f></m:oMath>';
+    assert.strictEqual(ommlToLatex(fracXml), '\\frac{a+b}{c-d}', '分数必须转译为 \\frac{a+b}{c-d}');
+
+    // 上标测试
+    const supXml = '<m:oMath><m:sSup><m:e><m:r><m:t>x</m:t></m:r></m:e><m:sup><m:r><m:t>2</m:t></m:r></m:sup></m:sSup></m:oMath>';
+    assert.strictEqual(ommlToLatex(supXml), '{x}^{2}', '上标必须转译为 {x}^{2}');
+
+    // 根号测试
+    const radXml = '<m:oMath><m:rad><m:deg><m:r><m:t>3</m:t></m:r></m:deg><m:e><m:r><m:t>x</m:t></m:r></m:e></m:rad></m:oMath>';
+    assert.strictEqual(ommlToLatex(radXml), '\\sqrt[3]{x}', '带次数根号转译为 \\sqrt[3]{x}');
+
+    // 求和测试
+    const naryXml = '<m:oMath><m:nary><m:naryPr><m:chr m:val="∑"/></m:naryPr><m:sub><m:r><m:t>i=1</m:t></m:r></m:sub><m:sup><m:r><m:t>n</m:t></m:r></m:sup><m:e><m:r><m:t>x</m:t></m:r></m:e></m:nary></m:oMath>';
+    assert.strictEqual(ommlToLatex(naryXml), '\\sum_{i=1}^{n} x', '求和转译为 \\sum_{i=1}^{n} x');
+  });
+
+  test("preload.js 与强类型: 暴露 readRichDocument 接口与类型完备", () => {
+    const preloadJs = fs.readFileSync(path.join(rootDir, "preload.js"), "utf8");
+    assert.ok(preloadJs.includes("readRichDocument:"), "preload.js 必须暴露 readRichDocument");
+
+    const electronDts = fs.readFileSync(path.join(rootDir, "src", "types", "electron.d.ts"), "utf8");
+    assert.ok(electronDts.includes("readRichDocument?:"), "electron.d.ts 必须定义 readRichDocument 方法签名");
+    assert.ok(electronDts.includes("DocxRichDocument"), "electron.d.ts 必须导出 DocxRichDocument 接口");
+    assert.ok(electronDts.includes("ReadRichDocumentResult"), "electron.d.ts 必须导出 ReadRichDocumentResult 接口");
+  });
+
+  test("前端渲染层: DocxReader 与 PdfReader 与 PreviewPanel 多模式阅读切换", () => {
+    const docxReaderTsx = fs.readFileSync(path.join(rootDir, "src", "components", "PreviewPanel", "DocxReader.tsx"), "utf8");
+    assert.ok(docxReaderTsx.includes("renderLatex"), "DocxReader 必须集成 KaTeX renderLatex 公式渲染");
+    assert.ok(docxReaderTsx.includes("onAttachImage"), "DocxReader 必须支持一键引用图片至会话");
+
+    const pdfReaderTsx = fs.readFileSync(path.join(rootDir, "src", "components", "PreviewPanel", "PdfReader.tsx"), "utf8");
+    assert.ok(pdfReaderTsx.includes("pdfjsLib"), "PdfReader 必须采用 pdfjs-dist 进行 Canvas 矢量绘制");
+    assert.ok(pdfReaderTsx.includes("scale"), "PdfReader 必须支持平滑缩放");
+
+    const previewPanelTsx = fs.readFileSync(path.join(rootDir, "src", "components", "PreviewPanel", "PreviewPanel.tsx"), "utf8");
+    assert.ok(previewPanelTsx.includes("'reading'"), "PreviewPanel 必须提供 'reading' 阅读视图模式");
+    assert.ok(previewPanelTsx.includes("onAttachImage"), "PreviewPanel 必须支持 onAttachImage 回调接线");
+  });
+
+  test("ChatStream 气泡渲染: MarkdownRenderer 全链路支持 LaTeX 行内与块级公式", () => {
+    const mdRendererTsx = fs.readFileSync(path.join(rootDir, "src", "components", "ChatStream", "MarkdownRenderer.tsx"), "utf8");
+    assert.ok(mdRendererTsx.includes("renderLatex"), "MarkdownRenderer 必须引入 renderLatex 工具");
+    assert.ok(mdRendererTsx.includes("inline-math"), "MarkdownRenderer 必须支持行内 $...$ 公式并赋予样式");
+    assert.ok(mdRendererTsx.includes("mathBlockRegex") || mdRendererTsx.includes("$$"), "MarkdownRenderer 必须支持独立块级 $$...$$ 公式");
+  });
+
+  test("ADR 0002: 文档多模态与数学公式引擎设计决策记录完备", () => {
+    const adrPath = path.join(rootDir, "docs", "adr", "0002-rich-document-pipeline-images-math.md");
+    assert.ok(fs.existsSync(adrPath), "ADR 0002 必须存在");
+    const content = fs.readFileSync(adrPath, "utf8");
+    assert.ok(content.includes("OMML"), "ADR 必须详述 OMML 递归转译策略");
+    assert.ok(content.includes("KaTeX"), "ADR 必须详述 KaTeX 渲染选型与性能收益");
+    assert.ok(content.includes("Token 成本"), "ADR 必须详述按需引图防护 Token 爆炸机制");
+  });
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, '/')}`) {

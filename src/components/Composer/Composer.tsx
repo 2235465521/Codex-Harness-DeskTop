@@ -21,6 +21,8 @@ interface ComposerProps {
   permissionMode: PermissionMode;
   onSelectPermissionMode: (mode: PermissionMode) => void;
   currentSessionId?: string | null;
+  attachedImages?: AttachedImage[];
+  onImagesChange?: (images: AttachedImage[]) => void;
 }
 
 const SLASH_COMMANDS = [
@@ -135,8 +137,19 @@ export const Composer: React.FC<ComposerProps> = ({
   permissionMode,
   onSelectPermissionMode,
   currentSessionId,
+  attachedImages,
+  onImagesChange,
 }) => {
-  const [images, setImages] = useState<AttachedImage[]>([]);
+  const [internalImages, setInternalImages] = useState<AttachedImage[]>([]);
+  const images = attachedImages !== undefined ? attachedImages : internalImages;
+  const setImages = (action: React.SetStateAction<AttachedImage[]>) => {
+    if (attachedImages !== undefined && onImagesChange) {
+      const next = typeof action === 'function' ? (action as any)(attachedImages) : action;
+      onImagesChange(next);
+    } else {
+      setInternalImages(action);
+    }
+  };
   const [textFiles, setTextFiles] = useState<AttachedTextFile[]>([]);
   const [attachHint, setAttachHint] = useState<string | null>(null);
 

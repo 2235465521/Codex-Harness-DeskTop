@@ -18,6 +18,7 @@
 - **Security Sandbox (主进程安全沙箱)**：守卫 `chat-only`、`workspace-readonly`、`workspace-readwrite` 三级权限，防护目录穿透与软链接逃逸，写回代码自动保留 `.bak` 备份。
 - **Abort & Rollback (中断与撤回机制)**：模型流式生成时可物理切断网络 (`req.destroy()`)，用户提问支持一键成对撤回并原样回填至输入框重发。
 - **Cross-platform Guardrails & Skill Audit (跨平台护栏与技能扫描)**：内置零外部依赖跨平台 Git 拦截护栏与 43 项技能静态健康扫描器，守卫工程资产与操作安全。
+- **Rich Document Pipeline (文档多模态与公式引擎)**：对齐学术论文与工业规范场景。主进程内置零依赖 OMML-to-LaTeX 转译器与媒体抽取器，前端集成 KaTeX 与 Canvas 视图，在右侧面板实现 Word/PDF 图文公式原生排版，并支持“一键引图入会话”无缝接入视觉大模型。
 
 ---
 
