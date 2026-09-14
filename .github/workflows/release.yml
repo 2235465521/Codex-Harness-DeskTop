@@ -30,8 +30,6 @@ jobs:
 
       - name: Build UI & Pack Installer
         run: npm run build
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Full Test Suite
         run: npm test
@@ -43,6 +41,7 @@ jobs:
           files: |
             release/**/*.exe
             release/**/*.blockmap
+            release/**/RELEASE_NOTES.md
             release/latest.yml
           generate_release_notes: true
         env:
