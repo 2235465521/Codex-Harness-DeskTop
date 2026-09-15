@@ -125,6 +125,48 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
   const [richDocData, setRichDocData] = useState<ReadRichDocumentResult | null>(null);
   const [lightboxImg, setLightboxImg] = useState<{ src: string; name?: string } | null>(null);
 
+  // ↔️ 右侧预览栏左缘拖拽拉伸 (范围 360px ~ 900px，默认 420，持久化保存)
+  const PANEL_MIN_W = 360;
+  const PANEL_MAX_W = 900;
+  const PANEL_DEFAULT_W = 420;
+  const [panelWidth, setPanelWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('codex_preview_panel_width');
+      if (saved) return Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, parseInt(saved, 10)));
+    } catch (e) {}
+    return PANEL_DEFAULT_W;
+  });
+  const [isResizing, setIsResizing] = useState(false);
+
+  useEffect(() => {
+    if (!isResizing) return;
+    let latestWidth = panelWidth;
+    const handleMouseMove = (e: MouseEvent) => {
+      const maxW = Math.min(PANEL_MAX_W, Math.floor(window.innerWidth * 0.7));
+      const newWidth = Math.max(PANEL_MIN_W, Math.min(maxW, window.innerWidth - e.clientX));
+      latestWidth = newWidth;
+      setPanelWidth(newWidth);
+    };
+    const handleMouseUp = () => {
+      setIsResizing(false);
+      try {
+        localStorage.setItem('codex_preview_panel_width', latestWidth.toString());
+      } catch (e) {}
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+    // 仅在 isResizing 切换时挂载/卸载；拖拽中用闭包 latestWidth 落盘
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isResizing]);
+
   const isRichDoc = useMemo(() => {
     return !!filePath && /\.(docx|pdf)$/i.test(filePath);
   }, [filePath]);
@@ -196,9 +238,24 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
 
   return (
     <>
-      <aside className={`h-full bg-bg-sidebar border-l border-border flex flex-col flex-shrink-0 animate-slideLeft z-20 select-none shadow-xl transition-all duration-200 ${
-        viewMode === 'diff' ? 'w-96 sm:w-[520px]' : viewMode === 'reading' ? 'w-96 sm:w-[500px] lg:w-[560px]' : 'w-88 sm:w-96'
-      }`}>
+      <aside
+        style={{ width: `${panelWidth}px` }}
+        className={`relative h-full bg-bg-sidebar border-l border-border flex flex-col flex-shrink-0 animate-slideLeft z-20 select-none shadow-xl ${
+          isResizing ? 'cursor-col-resize' : 'transition-[width] duration-150'
+        }`}
+      >
+        {/* ↔️ 左边缘微光拖拽手柄条 */}
+        <div
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setIsResizing(true);
+          }}
+          className="absolute top-0 left-0 w-2 h-full cursor-col-resize hover:bg-accent/40 active:bg-accent transition-colors z-30 group"
+          title="按住左右拖拽调节预览栏宽度"
+        >
+          <div className="w-0.5 h-full mx-auto bg-transparent group-hover:bg-accent group-active:bg-accent transition-colors" />
+        </div>
+
         {/* 头部导航与模式切换 */}
         <div className="h-13 px-4 border-b border-border flex items-center justify-between">
           <div className="flex items-center gap-2 text-xs font-bold text-text-primary">
@@ -374,7 +431,7 @@ export const PreviewPanel: React.FC<PreviewPanelProps> = ({
 
             {/* 2. 源码 / 纯文本视图 */}
             {viewMode === 'code' && (
-              <pre className="p-3 font-mono text-text-secondary text-[11px] leading-relaxed overflow-x-auto whitespace-pre-wrap bg-bg-base/60 select-text max-h-[calc(100vh-240px)]">
+              <pre className="p-3 font-mono text-text-secondary text-[11px] leading-relaxed overflow-x-auto whitespace-pre bg-bg-base/60 select-text max-h-[calc(100vh-240px)]">
                 <code>{codeContent}</code>
               </pre>
             )}

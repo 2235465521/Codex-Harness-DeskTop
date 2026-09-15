@@ -59,7 +59,8 @@ function looksLikeEarlyEnd(content: string, finishReason?: string): boolean {
 
 const EARLY_END_MARKER = '[输出提前结束]';
 const EARLY_END_NOTE_RE = /\n*\n⚠️\s*\[输出提前结束\][^\n]*(?:\n(?!\n)[^\n]*)*$/u;
-const CONTINUE_PROMPT = '请从上次中断处继续写完，不要重复已输出的内容。';
+const CONTINUE_PROMPT =
+  '请从上次中断处继续完成任务。优先使用对话中【已读文件上下文保留】与已有分析，不要无故重新通读已读文件；仅在缺失关键文件时再调用 read_workspace_file。不要重复已输出的内容。';
 
 /** 兼容模型误传 path / file */
 function pickRelativePath(args: Record<string, unknown> | null | undefined): string {
@@ -468,11 +469,51 @@ async function executeReadWorkspaceTools(
   return { lines, results };
 }
 
-/** 读盘 / 写盘 / MCP 工具多轮上限（首轮 + 续轮，对齐连接器规格默认 5） */
-const MAX_WRITE_TOOL_ROUNDS = 5;
+/** 单批工具续跑上限（首轮工具执行后的模型↔工具往返次数） */
+const MAX_WRITE_TOOL_ROUNDS = 15;
+/** 单批打满后仍有待执行工具时，同回合自动开下一批（始终复用 roundMessages，避免丢已读正文） */
+const MAX_TOOL_AUTO_BATCHES = 3;
+/** 跨用户「继续」时写入会话的已读摘录：单文件上限 / 最多保留路径数 */
+const TOOL_CARRY_CHARS_PER_FILE = 2500;
+const TOOL_CARRY_MAX_FILES = 8;
+const TOOL_CARRY_MARKER = '<!-- CODEX_TOOL_CARRY -->';
 
 function isAgentToolName(name: string) {
   return name === 'read_workspace_file' || name === 'write_workspace_file' || name.startsWith('mcp__');
+}
+
+/** 从本轮工具结果中收集读盘正文，供同会话续写与用户点「继续」时复用 */
+function collectReadCarryEntries(
+  calls: CodexToolCall[],
+  results: { id: string; name: string; content: string }[],
+  sink: Map<string, string>
+) {
+  for (const r of results) {
+    if (r.name !== 'read_workspace_file') continue;
+    const body = typeof r.content === 'string' ? r.content : '';
+    if (!body || body.startsWith('{"ok":false')) continue;
+    const tc = calls.find((c) => c.id === r.id);
+    let rel = '';
+    try {
+      rel = pickRelativePath(JSON.parse(tc?.arguments || '{}'));
+    } catch {
+      rel = '';
+    }
+    if (!rel) continue;
+    sink.set(rel, body.slice(0, TOOL_CARRY_CHARS_PER_FILE));
+  }
+}
+
+function buildToolContextCarry(sink: Map<string, string>): string {
+  const items = [...sink.entries()].slice(-TOOL_CARRY_MAX_FILES);
+  if (!items.length) return '';
+  const blocks = items
+    .map(([p, c]) => `### \`${p}\`\n\`\`\`\n${c}\n\`\`\``)
+    .join('\n\n');
+  return (
+    `\n\n---\n${TOOL_CARRY_MARKER}\n**【已读文件上下文保留】**（共 ${items.length} 个文件摘录，续写时请优先复用，勿无故重读）\n` +
+    blocks
+  );
 }
 
 function connectorToolsToOpenAI(tools: ConnectorToolInfo[]) {
@@ -1429,13 +1470,15 @@ export const App: React.FC = () => {
             thinking: response?.thinking || prev.thinking || (hasPendingAgentTools ? '正在执行工具...' : '任务思考已完成。')
           }));
 
-          // 读盘 / 写盘 / MCP：执行工具 + @@@write_file 标记兜底 + 有限多轮续跑
+          // 读盘 / 写盘 / MCP：执行工具 + @@@write_file 标记兜底 + 同回合多批续跑（保留 roundMessages）
           {
             const toolResults: string[] = [];
+            const readCarryMap = new Map<string, string>();
             let lastApiToolCalls = collectedToolCalls.filter((t) => isAgentToolName(t.name));
             let lastAssistantText = streamedContentAcc || response?.content || '';
             let roundMessages: any[] = [...contextMessages];
             let toolRound = 0;
+            let toolBatch = 0;
 
             if (lastApiToolCalls.length > 0) {
               // 补全 tool call id，供后续 role=tool 关联
@@ -1446,12 +1489,15 @@ export const App: React.FC = () => {
               const exec1 = await executeAgentTools(lastApiToolCalls, handleFileWritten);
               toolResults.push(...exec1.lines);
               let results = exec1.results;
+              collectReadCarryEntries(lastApiToolCalls, results, readCarryMap);
 
-              while (
-                lastApiToolCalls.length > 0 &&
-                toolRound < MAX_WRITE_TOOL_ROUNDS - 1 &&
-                activeStreamIdRef.current
-              ) {
+              // 外层：单批轮次打满后仍有工具需求时自动开下一批，不中断生成、不丢已读正文
+              while (lastApiToolCalls.length > 0 && activeStreamIdRef.current) {
+                while (
+                  lastApiToolCalls.length > 0 &&
+                  toolRound < MAX_WRITE_TOOL_ROUNDS - 1 &&
+                  activeStreamIdRef.current
+                ) {
                 toolRound += 1;
 
                 if (effectiveProtocol === 'anthropic') {
@@ -1503,10 +1549,10 @@ export const App: React.FC = () => {
 
                 updateLastMessageInCurrentSession((prev) => ({
                   ...prev,
-                  thinking: `${prev.thinking || ''}\n🔄 工具结果已回传，第 ${toolRound + 1} 轮续跑...`.trim(),
+                  thinking: `${prev.thinking || ''}\n🔄 工具结果已回传，第 ${toolBatch + 1} 批 · 第 ${toolRound + 1} 轮续跑...`.trim(),
                 }));
 
-                const contStreamId = `${streamId}_tool${toolRound}`;
+                const contStreamId = `${streamId}_tool${toolBatch}_${toolRound}`;
                 activeStreamIdRef.current = contStreamId;
                 let contContentAcc = '';
                 let contToolCalls: CodexToolCall[] = [];
@@ -1594,7 +1640,10 @@ export const App: React.FC = () => {
                   timeout: matchedModel?.timeoutSeconds,
                 });
 
-                if (!contRes?.ok) break;
+                if (!contRes?.ok) {
+                  lastApiToolCalls = [];
+                  break;
+                }
 
                 const contParsed = safeParseLlmBody(contRes.body);
                 if (effectiveProtocol === 'anthropic') {
@@ -1643,14 +1692,28 @@ export const App: React.FC = () => {
                 lastAssistantText = contContentAcc;
                 lastApiToolCalls = contToolCalls
                   .filter((t) => isAgentToolName(t.name))
-                  .map((tc, i) => ({ ...tc, id: tc.id || `call_${Date.now()}_${toolRound}_${i}` }));
+                  .map((tc, i) => ({ ...tc, id: tc.id || `call_${Date.now()}_${toolBatch}_${toolRound}_${i}` }));
 
                 if (lastApiToolCalls.length === 0) break;
 
                 const next = await executeAgentTools(lastApiToolCalls, handleFileWritten);
                 toolResults.push(...next.lines);
                 results = next.results;
-              }
+                collectReadCarryEntries(lastApiToolCalls, results, readCarryMap);
+                } // end inner while (单批轮次)
+
+                if (lastApiToolCalls.length === 0 || !activeStreamIdRef.current) break;
+
+                // 本批轮次用尽但仍有待回传的工具结果：自动开下一批，继续挂工具（不走无工具收束）
+                if (toolBatch >= MAX_TOOL_AUTO_BATCHES - 1) break;
+
+                toolBatch += 1;
+                toolRound = 0;
+                updateLastMessageInCurrentSession((prev) => ({
+                  ...prev,
+                  thinking: `${prev.thinking || ''}\n🚀 第 ${toolBatch} 批工具轮次已满，自动开启第 ${toolBatch + 1} 批续跑（保留已读文件上下文）...`.trim(),
+                }));
+              } // end outer while (自动多批)
 
               // 末轮收束：工具已执行但结果尚未回传模型时，再请求一次且不挂工具，避免停在「已读取」无终答
               if (lastApiToolCalls.length > 0 && results.length > 0 && activeStreamIdRef.current) {
@@ -1823,10 +1886,19 @@ export const App: React.FC = () => {
             }
 
             if (toolResults.length > 0) {
+              const carryBlock = buildToolContextCarry(readCarryMap);
               updateLastMessageInCurrentSession((prev) => ({
                 ...prev,
-                content: `${prev.content || ''}\n\n---\n**🔧 工具执行结果**\n${toolResults.join('\n')}`.trim(),
+                content: `${prev.content || ''}\n\n---\n**🔧 工具执行结果**\n${toolResults.join('\n')}${carryBlock}`.trim(),
               }));
+            } else {
+              const carryBlock = buildToolContextCarry(readCarryMap);
+              if (carryBlock) {
+                updateLastMessageInCurrentSession((prev) => ({
+                  ...prev,
+                  content: `${prev.content || ''}${carryBlock}`.trim(),
+                }));
+              }
             }
 
             // 正常关流但疑似截断：只打 earlyEnded 标记，文案在 UI 展示，避免污染后续上下文

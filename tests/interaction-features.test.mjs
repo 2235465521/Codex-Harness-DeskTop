@@ -140,6 +140,10 @@ export function runInteractionFeaturesTests() {
     assert.ok(app.includes("executeWriteWorkspaceTools"), "App 必须执行写盘工具");
     assert.ok(app.includes("extractTaggedWriteFiles"), "必须支持 @@@write_file 标记兜底");
     assert.ok(app.includes("MAX_WRITE_TOOL_ROUNDS"), "必须限制工具多轮续跑");
+    assert.ok(app.includes("MAX_TOOL_AUTO_BATCHES"), "必须支持同回合自动多批续跑");
+    assert.ok(/MAX_WRITE_TOOL_ROUNDS\s*=\s*15/.test(app), "单批工具轮次应对齐主流 Agent（≥15）");
+    assert.ok(/MAX_TOOL_AUTO_BATCHES\s*=\s*3/.test(app), "自动续跑批次数应为 3");
+    assert.ok(app.includes("CODEX_TOOL_CARRY") || app.includes("已读文件上下文保留"), "必须把已读摘录写入会话供续写");
     assert.ok(app.includes("tool_call_id") || app.includes("tool_result"), "续跑须回传 tool 结果");
   });
 

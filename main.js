@@ -1153,7 +1153,7 @@ function downloadFile(url, destPath, onProgress) {
         return reject(new Error("所有下载源均尝试失败，请检查网络连接"));
       }
       const currentUrl = candidateUrls[candidateIndex++];
-      console.log(`[codex-desktop] 尝试下载更新包 (${candidateIndex}/${candidateUrls.length}):`, currentUrl);
+      console.warn(`[codex-desktop] 尝试下载更新包 (${candidateIndex}/${candidateUrls.length}):`, currentUrl);
 
       const file = fs.createWriteStream(destPath);
       const getOptions = { headers: { "User-Agent": "cline/3.0.0" } };
