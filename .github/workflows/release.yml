@@ -34,30 +34,6 @@ jobs:
       - name: Run Full Test Suite
         run: npm test
 
-      - name: Purge Existing Release for Tag
-        uses: actions/github-script@v7
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          script: |
-            try {
-              const tag = context.ref.replace('refs/tags/', '');
-              const rel = await github.rest.repos.getReleaseByTag({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                tag: tag
-              });
-              if (rel && rel.data) {
-                console.log(`Deleting previous release id ${rel.data.id} for tag ${tag}`);
-                await github.rest.repos.deleteRelease({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  release_id: rel.data.id
-                });
-              }
-            } catch (err) {
-              console.log('No existing release to purge:', err.message);
-            }
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
@@ -70,3 +46,34 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean Up Extraneous Release Assets
+        uses: actions/github-script@v7
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            try {
+              const rel = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tag
+              });
+              if (rel && rel.data && rel.data.assets) {
+                for (const asset of rel.data.assets) {
+                  if (asset.name === 'Codex.Desktop.exe' || asset.name === 'elevate.exe') {
+                    console.log(`Deleting bad asset ${asset.name} (id ${asset.id})`);
+                    await github.rest.repos.deleteReleaseAsset({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      asset_id: asset.id
+                    });
+                    console.log(`Successfully deleted ${asset.name}`);
+                  }
+                }
+              }
+            } catch (err) {
+              console.error('Asset cleanup failed:', err);
+              throw err;
+            }
