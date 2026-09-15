@@ -1175,6 +1175,7 @@ function downloadFile(url, destPath, onProgress) {
         const client = targetUrl.startsWith("http:") ? http : https;
         const req = client.get(targetUrl, getOptions, (res) => {
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            if (reqTimeout) { clearTimeout(reqTimeout); reqTimeout = null; }
             let nextLoc = res.headers.location;
             if (nextLoc.startsWith("/")) {
               const prevUrl = new URL(targetUrl);
@@ -1318,7 +1319,9 @@ function checkForUpdates(isSilent = false) {
           const currentVer = app.getVersion();
 
           if (latestTag && isNewerVersion(latestTag, currentVer)) {
-            const exeAsset = (data.assets || []).find((a) => a.name && a.name.endsWith(".exe"));
+            const assets = data.assets || [];
+            const exeAsset = assets.find((a) => a.name && a.name.endsWith(".exe") && /setup/i.test(a.name))
+              || assets.find((a) => a.name && a.name.endsWith(".exe") && !/elevate/i.test(a.name));
             const downloadUrl = exeAsset ? exeAsset.browser_download_url : "";
 
             // 向渲染进程广播更新就绪事件

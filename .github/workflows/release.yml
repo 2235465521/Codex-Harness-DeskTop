@@ -34,14 +34,38 @@ jobs:
       - name: Run Full Test Suite
         run: npm test
 
+      - name: Purge Existing Release for Tag
+        uses: actions/github-script@v7
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          script: |
+            try {
+              const tag = context.ref.replace('refs/tags/', '');
+              const rel = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tag
+              });
+              if (rel && rel.data) {
+                console.log(`Deleting previous release id ${rel.data.id} for tag ${tag}`);
+                await github.rest.repos.deleteRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: rel.data.id
+                });
+              }
+            } catch (err) {
+              console.log('No existing release to purge:', err.message);
+            }
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            release/**/*.exe
-            release/**/*.blockmap
-            release/**/RELEASE_NOTES.md
+            release/v*/*.exe
+            release/v*/*.blockmap
+            release/v*/RELEASE_NOTES.md
             release/latest.yml
           generate_release_notes: true
         env:
