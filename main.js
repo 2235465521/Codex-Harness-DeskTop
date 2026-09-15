@@ -1206,8 +1206,9 @@ function downloadFile(url, destPath, onProgress) {
           res.on("end", () => {
             if (hasEnded) return;
             hasEnded = true;
-            file.end();
-            resolve(destPath);
+            file.end(() => {
+              setTimeout(() => resolve(destPath), 300);
+            });
           });
 
           res.on("error", () => {
@@ -1385,7 +1386,7 @@ function checkForUpdates(isSilent = false) {
   queryRepo(0);
 }
 
-function applyPendingUpdate() {
+function applyPendingUpdate(retryCount = 0) {
   if (!pendingUpdateInstallerPath || !fs.existsSync(pendingUpdateInstallerPath)) return false;
   try {
     // /S 表示 NSIS 静默覆写安装，自动覆盖历史安装目录，无需用户手动卸载或重选路径
@@ -1397,6 +1398,11 @@ function applyPendingUpdate() {
     app.quit();
     return true;
   } catch (err) {
+    if (err.code === "EBUSY" && retryCount < 5) {
+      console.warn(`[codex-desktop] 安装包正忙 (EBUSY)，将在 500ms 后自动重试启动 (${retryCount + 1}/5)...`);
+      setTimeout(() => applyPendingUpdate(retryCount + 1), 500);
+      return true;
+    }
     dialog.showErrorBox("启动安装程序失败", `无法自动执行安装包: ${err.message}`);
     return false;
   }
