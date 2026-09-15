@@ -122,7 +122,12 @@ function parseLlmApiResult(res, endpoint = "", modelName = "", durationSec = "0.
   if (!isOk && status !== 200) {
     let errDetail = "";
     try {
-      const parsed = JSON.parse(bodyText);
+      let textToParse = bodyText;
+      if (textToParse.startsWith("data:") || textToParse.includes("\ndata:")) {
+        const firstLine = textToParse.split(/\r?\n/).find(l => l.trim().startsWith("data:"));
+        if (firstLine) textToParse = firstLine.trim().replace(/^data:\s*/, "");
+      }
+      const parsed = JSON.parse(textToParse);
       errDetail = (parsed.error && parsed.error.message) || parsed.message || "";
     } catch (e) {
       errDetail = bodyText;
@@ -138,9 +143,31 @@ function parseLlmApiResult(res, endpoint = "", modelName = "", durationSec = "0.
     };
   }
 
-  // 3. 解析正常 JSON
+  // 3. 解析正常 JSON 或 SSE 数据流
   try {
-    const data = JSON.parse(bodyText);
+    let data;
+    if (bodyText.startsWith("data:") || bodyText.includes("\ndata:")) {
+      let sseText = "";
+      let sseThinking = "";
+      const lines = bodyText.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const d = trimmed.replace(/^data:\s*/, "");
+        if (d === "[DONE]") continue;
+        try {
+          const p = JSON.parse(d);
+          const c = p.choices?.[0]?.delta;
+          const dt = c?.content || c?.text || p.choices?.[0]?.text || "";
+          const dth = c?.reasoning_content || c?.reasoning || "";
+          if (dt) sseText += dt;
+          if (dth) sseThinking += dth;
+        } catch {}
+      }
+      data = { choices: [{ message: { content: sseText, reasoning_content: sseThinking } }] };
+    } else {
+      data = JSON.parse(bodyText);
+    }
     let extractedContent = "";
     let extractedThinking = `思考完成 (${modelName || "LLM"})`;
 

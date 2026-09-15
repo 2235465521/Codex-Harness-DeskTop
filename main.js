@@ -2729,6 +2729,8 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
         let sseBuffer = "";
         let accumulatedText = "";
         let accumulatedThinking = "";
+        let streamError = null;
+        let streamUsage = null;
         // OpenAI tool_calls 按 index 累加（Wave D：真正执行写盘工具）
         const pendingToolCalls = {};
 
@@ -2796,10 +2798,18 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
 
                 try {
                   const parsed = JSON.parse(dataStr);
+                  // 捕获流式传输中可能下发的数据级错误（如欠费、限流、超长拦截等）
+                  if (parsed.error) {
+                    streamError = parsed.error.message || (typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error));
+                  }
+                  if (parsed.usage) {
+                    streamUsage = parsed.usage;
+                  }
+
                   // 1. OpenAI 兼容流式 Delta
                   const choice = parsed.choices?.[0];
-                  const deltaText = choice?.delta?.content || "";
-                  const deltaThinking = choice?.delta?.reasoning_content || choice?.delta?.reasoning || "";
+                  const deltaText = choice?.delta?.content || choice?.delta?.text || choice?.text || "";
+                  const deltaThinking = choice?.delta?.reasoning_content || choice?.delta?.reasoning || choice?.delta?.thought || "";
 
                   // 捕获 OpenAI 格式的工具调用并累加参数，不写入聊天正文（避免污染 Apply 解析）
                   const toolCalls = choice?.delta?.tool_calls;
@@ -2833,6 +2843,8 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
                       name: parsed.content_block.name || "",
                       arguments: ""
                     };
+                  } else if (parsed.type === "message_delta" && parsed.usage) {
+                    streamUsage = parsed.usage;
                   }
 
                   const contentDelta = deltaText || anthropicText || "";
@@ -2905,14 +2917,24 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
               });
             }
 
-            // 如果是流式模式，返回已组装好的统一格式，兼容后续兜底消费
+            // 如果是流式模式，返回已组装好的统一格式，兼容后续兜底消费并确保为合法 JSON 字符串
             let finalBody = responseBody;
-            if (stream && (accumulatedText || finishedToolCalls.length > 0)) {
+            if (stream && res.statusCode >= 200 && res.statusCode < 300) {
+              if (streamError) {
+                resolve({
+                  ok: false,
+                  status: 400,
+                  statusText: "Stream Error",
+                  body: JSON.stringify({ error: { message: streamError } }),
+                  canRetry: false
+                });
+                return;
+              }
               finalBody = JSON.stringify({
                 choices: [{
                   message: {
-                    content: accumulatedText,
-                    reasoning_content: accumulatedThinking,
+                    content: accumulatedText || "",
+                    reasoning_content: accumulatedThinking || "",
                     tool_calls: finishedToolCalls.map((tc, i) => ({
                       id: tc.id || `call_${i}`,
                       type: "function",
@@ -2920,8 +2942,31 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
                     }))
                   }
                 }],
+                usage: streamUsage,
                 codex_tool_calls: finishedToolCalls
               });
+            } else if (typeof responseBody === "string" && (responseBody.trim().startsWith("data:") || responseBody.includes("\ndata:"))) {
+              // 某些网关在错误时亦返回 text/event-stream 格式，清洗为 JSON 错误
+              try {
+                let extractedErr = "";
+                const lines = responseBody.trim().split(/\r?\n/);
+                for (const l of lines) {
+                  const t = l.trim();
+                  if (t.startsWith("data:")) {
+                    const raw = t.replace(/^data:\s*/, "");
+                    if (raw && raw !== "[DONE]") {
+                      const p = JSON.parse(raw);
+                      if (p.error?.message || p.message) {
+                        extractedErr = p.error?.message || p.message;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (extractedErr) {
+                  finalBody = JSON.stringify({ error: { message: extractedErr } });
+                }
+              } catch {}
             }
 
             resolve({

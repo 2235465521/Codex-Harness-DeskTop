@@ -85,7 +85,68 @@ const WRITE_WORKSPACE_FILE_TOOL_ANTHROPIC = {
 
 type CodexToolCall = { id?: string; name: string; arguments: string };
 
-/** 解析标记块兜底：@@@write_file path="a.md"\\n...@@@end */
+/** 安全解析 LLM 返回的响应体：自动兼容标准 JSON、原始 SSE 流式 data: 序列或纯文本，杜绝 Unexpected token 'd' 等异常 */
+function safeParseLlmBody(rawBody: any): any {
+  if (typeof rawBody !== 'string') return rawBody || {};
+  const trimmed = rawBody.trim();
+  if (!trimmed) return {};
+
+  // 1. 若响应为原始 SSE 流式文本 (以 data: 开头或包含换行 data:)，鲁棒提取内容与思考过程
+  if (trimmed.startsWith('data:') || trimmed.includes('\ndata:')) {
+    let accText = '';
+    let accThinking = '';
+    let streamErr: string | null = null;
+    let streamUsage: any = null;
+    const lines = trimmed.split(/\r?\n/);
+    for (const line of lines) {
+      const lineTrim = line.trim();
+      if (!lineTrim.startsWith('data:')) continue;
+      const payload = lineTrim.replace(/^data:\s*/, '');
+      if (payload === '[DONE]') continue;
+      try {
+        const item = JSON.parse(payload);
+        if (item.error) {
+          streamErr = item.error.message || (typeof item.error === 'string' ? item.error : JSON.stringify(item.error));
+        }
+        if (item.usage) streamUsage = item.usage;
+        const choice = item.choices?.[0];
+        const deltaText = choice?.delta?.content || choice?.delta?.text || choice?.text || '';
+        const deltaThinking = choice?.delta?.reasoning_content || choice?.delta?.reasoning || choice?.delta?.thought || '';
+        if (deltaText) accText += deltaText;
+        if (deltaThinking) accThinking += deltaThinking;
+      } catch {
+        // 忽略未解析完成的行
+      }
+    }
+    if (streamErr) {
+      return { error: { message: streamErr } };
+    }
+    return {
+      choices: [{
+        message: {
+          content: accText,
+          reasoning_content: accThinking,
+        }
+      }],
+      usage: streamUsage
+    };
+  }
+
+  // 2. 正常 JSON 解析，若解析失败则兜底为普通文本内容
+  try {
+    return JSON.parse(trimmed);
+  } catch (e) {
+    return {
+      choices: [{
+        message: {
+          content: trimmed
+        }
+      }]
+    };
+  }
+}
+
+/** 解析标记块兜底：@@@write_file path="a.md"\n...@@@end */
 function extractTaggedWriteFiles(text: string): { relativePath: string; content: string }[] {
   const out: { relativePath: string; content: string }[] = [];
   const re = /@@@write_file\s+path=["']([^"']+)["']\s*\r?\n([\s\S]*?)@@@end/gi;
@@ -1014,7 +1075,7 @@ export const App: React.FC = () => {
         });
 
         if (rawRes && rawRes.ok) {
-          const parsed = typeof rawRes.body === 'string' ? JSON.parse(rawRes.body) : rawRes.body;
+          const parsed = safeParseLlmBody(rawRes.body);
 
           // 提取真实 usage 指标并计算最终结算速率
           const usage = parsed?.usage;
@@ -1232,7 +1293,7 @@ export const App: React.FC = () => {
 
                 if (!contRes?.ok) break;
 
-                const contParsed = typeof contRes.body === 'string' ? JSON.parse(contRes.body) : contRes.body;
+                const contParsed = safeParseLlmBody(contRes.body);
                 if (effectiveProtocol === 'anthropic') {
                   const text = (contParsed.content || []).map((c: any) => c.text || '').join('');
                   if (!contContentAcc && text) {
@@ -1321,14 +1382,21 @@ export const App: React.FC = () => {
       let rawMsg = err.message || '网络连接超时或提供方异常';
       let friendlyError = rawMsg;
 
-      try {
-        const parsed = JSON.parse(rawMsg);
-        const innerMsg = parsed?.error?.message || parsed?.message || parsed?.error;
-        if (typeof innerMsg === 'string') {
-          friendlyError = innerMsg;
+      if (typeof rawMsg === 'string' && (rawMsg.startsWith('data:') || rawMsg.includes('\ndata:'))) {
+        const parsedSse = safeParseLlmBody(rawMsg);
+        if (parsedSse?.error?.message) {
+          friendlyError = parsedSse.error.message;
         }
-      } catch {
-        // 保持原样
+      } else {
+        try {
+          const parsed = JSON.parse(rawMsg);
+          const innerMsg = parsed?.error?.message || parsed?.message || parsed?.error;
+          if (typeof innerMsg === 'string') {
+            friendlyError = innerMsg;
+          }
+        } catch {
+          // 保持原样
+        }
       }
 
       if (friendlyError.includes('ECONNRESET')) {

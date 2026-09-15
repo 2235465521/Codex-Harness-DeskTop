@@ -308,6 +308,15 @@ export async function runInteractionFeaturesTests() {
     assert.ok(content.includes("KaTeX"), "ADR 必须详述 KaTeX 渲染选型与性能收益");
     assert.ok(content.includes("Token 成本"), "ADR 必须详述按需引图防护 Token 爆炸机制");
   });
+
+  test("LLM 流式管道鲁棒防护: safeParseLlmBody 与 streamError 隔离 (杜绝 Unexpected token 'd')", () => {
+    const appTsx = fs.readFileSync(path.join(rootDir, "src", "App.tsx"), "utf8");
+    const mainJs = fs.readFileSync(path.join(rootDir, "main.js"), "utf8");
+    assert.ok(appTsx.includes("function safeParseLlmBody"), "App.tsx 必须包含 safeParseLlmBody 安全解析函数");
+    assert.ok(appTsx.includes("safeParseLlmBody(rawRes.body)"), "App.tsx 必须使用 safeParseLlmBody 解析 rawRes.body");
+    assert.ok(mainJs.includes("streamError"), "main.js 必须具备 streamError 捕获");
+    assert.ok(mainJs.includes("Stream Error"), "main.js 必须在流式中断/错误时返回规范的 Stream Error 状态");
+  });
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, '/')}`) {
