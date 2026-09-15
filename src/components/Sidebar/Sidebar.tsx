@@ -520,7 +520,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             key={item.fullPath}
             onClick={() => {
               if (onSelectFile) onSelectFile(item);
-              onInsertPrompt(`@${item.path}`);
+              const fileRef = item.path.includes(' ') ? `@"${item.path}"` : `@${item.path}`;
+              onInsertPrompt(`${fileRef} `);
             }}
             style={{ paddingLeft: `${depth * 10 + 20}px` }}
             className="flex items-center gap-1.5 py-1 pr-2 rounded-md hover:bg-bg-hover cursor-pointer text-text-muted hover:text-text-primary text-xs transition-colors group"

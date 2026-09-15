@@ -8,6 +8,8 @@ export function useUpdater() {
   const [progress, setProgress] = useState<UpdateProgress>({ percent: 0, downloadedBytes: 0, totalBytes: 0 });
   const [isDownloaded, setIsDownloaded] = useState(false);
   const [downloadedVersion, setDownloadedVersion] = useState('');
+  const [isPendingOnQuit, setIsPendingOnQuit] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (!window.codexDesktop) return;
@@ -22,6 +24,7 @@ export function useUpdater() {
     if (window.codexDesktop.onUpdateDownloading) {
       window.codexDesktop.onUpdateDownloading(() => {
         setIsDownloading(true);
+        setErrorMessage(null);
       });
     }
 
@@ -38,15 +41,43 @@ export function useUpdater() {
         setIsDownloading(false);
       });
     }
+
+    if (window.codexDesktop.onUpdatePendingOnQuit) {
+      window.codexDesktop.onUpdatePendingOnQuit(() => {
+        setIsPendingOnQuit(true);
+      });
+    }
+
+    if (window.codexDesktop.onUpdateError) {
+      window.codexDesktop.onUpdateError((err) => {
+        setIsDownloading(false);
+        setErrorMessage(err.error || err.message || '更新下载失败');
+      });
+    }
   }, []);
 
   const startDownload = () => {
     if (updateInfo && window.codexDesktop && window.codexDesktop.startDownloadUpdate) {
       setIsDownloading(true);
+      setErrorMessage(null);
       window.codexDesktop.startDownloadUpdate({
         downloadUrl: updateInfo.downloadUrl,
         version: updateInfo.latestVersion
       });
+    }
+  };
+
+  const installNow = () => {
+    if (window.codexDesktop && window.codexDesktop.applyUpdateNow) {
+      window.codexDesktop.applyUpdateNow();
+    }
+  };
+
+  const installOnQuit = () => {
+    setIsPendingOnQuit(true);
+    setIsModalOpen(false);
+    if (window.codexDesktop && window.codexDesktop.applyUpdateOnQuit) {
+      window.codexDesktop.applyUpdateOnQuit();
     }
   };
 
@@ -68,7 +99,11 @@ export function useUpdater() {
     progress,
     isDownloaded,
     downloadedVersion,
+    isPendingOnQuit,
+    errorMessage,
     startDownload,
+    installNow,
+    installOnQuit,
     closeModal,
     checkForUpdates
   };

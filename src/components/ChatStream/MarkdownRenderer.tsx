@@ -3,6 +3,7 @@ import {
   Copy, Check, FileDown, CheckCheck, Loader2,
   FileCode, FileText
 } from 'lucide-react';
+import { renderLatex } from '../../utils/math';
 
 interface MarkdownRendererProps {
   content: string;
@@ -244,10 +245,10 @@ const CodeBlock: React.FC<{
   );
 };
 
-// 行内语法解析器：处理 `code` 与 **bold**
+// 行内语法解析器：处理 `code`、**bold** 与 $latex$ 行内公式
 function renderInline(text: string): React.ReactNode[] {
   const tokens: React.ReactNode[] = [];
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\$[^\$\n\r]+\$)/g;
   const parts = text.split(regex);
 
   parts.forEach((part, i) => {
@@ -266,6 +267,19 @@ function renderInline(text: string): React.ReactNode[] {
           {renderInline(part.slice(2, -2))}
         </strong>
       );
+    } else if (part.startsWith('$') && part.endsWith('$') && part.length >= 2) {
+      const formula = part.slice(1, -1).trim();
+      if (formula) {
+        tokens.push(
+          <span
+            key={i}
+            className="inline-math px-1 py-0.2 mx-0.5 rounded bg-accent/5 select-text font-normal inline-block align-middle"
+            dangerouslySetInnerHTML={{ __html: renderLatex(formula, false) }}
+          />
+        );
+      } else {
+        tokens.push(part);
+      }
     } else if (part) {
       tokens.push(part);
     }
@@ -356,7 +370,7 @@ function parseAlignments(delimiterRow: string): ('left' | 'center' | 'right')[] 
 }
 
 // 行段落解析器：处理标题、列表、引用、表格、自然留白等
-function renderParagraphBlock(text: string, blockKey: string | number): React.ReactNode {
+function renderParagraphBlockLines(text: string, blockKey: string | number): React.ReactNode {
   const lines = text.split('\n');
   const elements: React.ReactNode[] = [];
 
@@ -487,6 +501,42 @@ function renderParagraphBlock(text: string, blockKey: string | number): React.Re
   }
 
   return <div key={blockKey} className="space-y-1">{elements}</div>;
+}
+
+// 段落解析器：优先捕获独立块级数学公式 $$...$$，随后交由行级解析器处理
+function renderParagraphBlock(text: string, blockKey: string | number): React.ReactNode {
+  if (text.includes('$$')) {
+    const mathBlockRegex = /\$\$([\s\S]+?)\$\$/g;
+    const segments: React.ReactNode[] = [];
+    let lastIdx = 0;
+    let m: RegExpExecArray | null;
+    let segCount = 0;
+    while ((m = mathBlockRegex.exec(text)) !== null) {
+      const before = text.slice(lastIdx, m.index);
+      if (before.trim()) {
+        segments.push(renderParagraphBlockLines(before, `${blockKey}_before_${segCount}`));
+      }
+      const mathCode = m[1].trim();
+      if (mathCode) {
+        segments.push(
+          <div
+            key={`${blockKey}_math_${segCount}`}
+            className="my-3 py-2 px-3 bg-bg-card/40 border border-border/70 rounded-xl flex justify-center overflow-x-auto select-text shadow-2xs"
+            dangerouslySetInnerHTML={{ __html: renderLatex(mathCode, true) }}
+          />
+        );
+      }
+      lastIdx = m.index + m[0].length;
+      segCount++;
+    }
+    const tail = text.slice(lastIdx);
+    if (tail.trim()) {
+      segments.push(renderParagraphBlockLines(tail, `${blockKey}_tail_${segCount}`));
+    }
+    return <div key={blockKey} className="space-y-1">{segments}</div>;
+  }
+
+  return renderParagraphBlockLines(text, blockKey);
 }
 
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({

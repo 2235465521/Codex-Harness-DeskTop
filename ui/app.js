@@ -122,7 +122,12 @@ function parseLlmApiResult(res, endpoint = "", modelName = "", durationSec = "0.
   if (!isOk && status !== 200) {
     let errDetail = "";
     try {
-      const parsed = JSON.parse(bodyText);
+      let textToParse = bodyText;
+      if (textToParse.startsWith("data:") || textToParse.includes("\ndata:")) {
+        const firstLine = textToParse.split(/\r?\n/).find(l => l.trim().startsWith("data:"));
+        if (firstLine) textToParse = firstLine.trim().replace(/^data:\s*/, "");
+      }
+      const parsed = JSON.parse(textToParse);
       errDetail = (parsed.error && parsed.error.message) || parsed.message || "";
     } catch (e) {
       errDetail = bodyText;
@@ -138,9 +143,31 @@ function parseLlmApiResult(res, endpoint = "", modelName = "", durationSec = "0.
     };
   }
 
-  // 3. 解析正常 JSON
+  // 3. 解析正常 JSON 或 SSE 数据流
   try {
-    const data = JSON.parse(bodyText);
+    let data;
+    if (bodyText.startsWith("data:") || bodyText.includes("\ndata:")) {
+      let sseText = "";
+      let sseThinking = "";
+      const lines = bodyText.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const d = trimmed.replace(/^data:\s*/, "");
+        if (d === "[DONE]") continue;
+        try {
+          const p = JSON.parse(d);
+          const c = p.choices?.[0]?.delta;
+          const dt = c?.content || c?.text || p.choices?.[0]?.text || "";
+          const dth = c?.reasoning_content || c?.reasoning || "";
+          if (dt) sseText += dt;
+          if (dth) sseThinking += dth;
+        } catch {}
+      }
+      data = { choices: [{ message: { content: sseText, reasoning_content: sseThinking } }] };
+    } else {
+      data = JSON.parse(bodyText);
+    }
     let extractedContent = "";
     let extractedThinking = `思考完成 (${modelName || "LLM"})`;
 
@@ -1121,6 +1148,65 @@ document.addEventListener("DOMContentLoaded", () => {
     executeNextQueuedInstruction();
   }
 
+  const AT_FILE_EXTS = 'docx|xlsx|xls|pdf|doc|pptx|txt|md|json|js|jsx|ts|tsx|mjs|cjs|py|css|html|htm|yml|yaml|xml|csv|sh|ps1|java|go|rs|toml|ini|vue|c|cpp|h|hpp|cs|kt|swift|rb|php|sql|bat|env|svg|png|jpg|jpeg|gif|webp|log|diff|patch|lock';
+
+  function getAtMentionTokens(text) {
+    if (!text || !text.includes('@')) return [];
+    const tokens = [];
+    const regex = new RegExp(
+      '(?:^|[\\s,，。！？!?；;（）()\\[\\]{}"\'`])(@"[^"\\n]+"|@\'[^\'\\n]+\'|@[^\\s@"\'`][^\\n@]*?\\.(?:' +
+        AT_FILE_EXTS +
+        ')(?=[\\s,，。；;）)\\]}]|$)|@[^\\s,，。！？!?；;（）()\\[\\]{}"\'`]+)',
+      'g'
+    );
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const fullMatch = match[0];
+      const mention = match[1];
+      if (!mention) continue;
+      const atIndex = match.index + (fullMatch.length - mention.length);
+      const endIndex = atIndex + mention.length;
+      tokens.push({ start: atIndex, end: endIndex, raw: mention });
+    }
+    return tokens;
+  }
+
+  function handleAtMentionDeletion(text, cursorPos, key) {
+    if (!text || !text.includes('@')) return null;
+    const tokens = getAtMentionTokens(text);
+    if (tokens.length === 0) return null;
+    for (const token of tokens) {
+      let target = false;
+      if (key === 'Backspace') {
+        if (cursorPos > token.start && cursorPos <= token.end) {
+          target = true;
+        } else if (cursorPos === token.end + 1 && text.charAt(token.end) === ' ') {
+          target = true;
+        }
+      } else if (key === 'Delete') {
+        if (cursorPos >= token.start && cursorPos < token.end) {
+          target = true;
+        }
+      }
+      if (target) {
+        let delStart = token.start;
+        let delEnd = token.end;
+        if (text.charAt(delEnd) === ' ') {
+          delEnd += 1;
+        } else if (
+          delStart > 0 &&
+          text.charAt(delStart - 1) === ' ' &&
+          (delEnd >= text.length || /^[\s,，。！？!?；;、）)\]}]/.test(text.charAt(delEnd)))
+        ) {
+          delStart -= 1;
+        }
+        const newText = text.slice(0, delStart) + text.slice(delEnd);
+        return { newText, newCursorPos: delStart };
+      }
+    }
+    return null;
+  }
+
   if (btnSend) btnSend.addEventListener("click", () => sendMessage());
   if (composerInput) {
     composerInput.addEventListener("keydown", (e) => {
@@ -1128,6 +1214,21 @@ document.addEventListener("DOMContentLoaded", () => {
         e.preventDefault();
         sendMessage();
         composerInput.style.height = "";
+        return;
+      }
+
+      // 原子化删除 @ 引用：当按下退格键或 Delete 键时，将整段 @ 路径整体剔除
+      if (e.key === "Backspace" || e.key === "Delete") {
+        if (composerInput.selectionStart === composerInput.selectionEnd) {
+          const result = handleAtMentionDeletion(composerInput.value, composerInput.selectionStart, e.key);
+          if (result) {
+            e.preventDefault();
+            composerInput.value = result.newText;
+            composerInput.setSelectionRange(result.newCursorPos, result.newCursorPos);
+            composerInput.dispatchEvent(new Event("input"));
+            return;
+          }
+        }
       }
     });
 

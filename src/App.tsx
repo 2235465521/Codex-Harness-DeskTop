@@ -68,6 +68,87 @@ function pickRelativePath(args: Record<string, unknown> | null | undefined): str
   return String(raw ?? '').trim();
 }
 
+/**
+ * 安全解析 LLM 响应体。流式收尾若误回传裸 SSE（data: {...}），不得 JSON.parse 抛错并误报传输中断。
+ * 此时返回空 choices，由调用方回退到已流式写入的正文/思考。
+ */
+function parseLlmResponseBody(body: unknown): any {
+  if (body == null) return {};
+  if (typeof body !== 'string') return body;
+  const trimmed = body.trim();
+  if (!trimmed) return {};
+  if (
+    trimmed.startsWith('<!DOCTYPE') ||
+    trimmed.startsWith('<!doctype') ||
+    trimmed.startsWith('<html') ||
+    trimmed.includes('<head>')
+  ) {
+    return { _htmlResponse: true, choices: [{ message: { content: '', reasoning_content: '' } }] };
+  }
+  if (/^data:\s*/i.test(trimmed) || trimmed.includes('\ndata:')) {
+    return { choices: [{ message: { content: '', reasoning_content: '' } }], _rawSse: true };
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return { choices: [{ message: { content: '', reasoning_content: '' } }], _parseError: true };
+  }
+}
+
+/** 统一抽取 OpenAI / Anthropic usage，供状态栏真实 token 指标 */
+function extractUsageTokens(usage: any, fallbackInput: number, fallbackOutput: number) {
+  const u = usage && typeof usage === 'object' ? usage : null;
+  const realInputTokens = u?.prompt_tokens ?? u?.input_tokens ?? fallbackInput;
+  const realOutputTokens = u?.completion_tokens ?? u?.output_tokens ?? fallbackOutput;
+  const cachedTokens =
+    u?.prompt_tokens_details?.cached_tokens ??
+    u?.cache_read_input_tokens ??
+    u?.cached_tokens ??
+    null;
+  return { realInputTokens, realOutputTokens, cachedTokens };
+}
+
+/** 将底层异常转为用户可读文案；JSON 解析失败不再误标为网络传输中断 */
+function formatLlmFailureMessage(rawMsg: string): string {
+  let friendlyError = rawMsg || '网络连接超时或提供方异常';
+
+  try {
+    const parsed = JSON.parse(friendlyError);
+    const innerMsg = parsed?.error?.message || parsed?.message || parsed?.error;
+    if (typeof innerMsg === 'string') {
+      friendlyError = innerMsg;
+    }
+  } catch {
+    // 保持原样
+  }
+
+  if (/Unexpected token|is not valid JSON|JSON\.parse/i.test(friendlyError)) {
+    return '响应体解析失败（上游返回了非 JSON 或流式格式异常）。若聊天区已有部分内容则已保留，可重试或检查 Base URL / 模型配置。';
+  }
+
+  if (friendlyError.includes('ECONNRESET')) {
+    return '网络连接被服务商/代理强行重置 (read ECONNRESET)。已自动重试 2 次仍未连通，通常为模型服务商网关抖动或网络代理切断，建议稍后重试。';
+  }
+  if (friendlyError.includes('ETIMEDOUT') || friendlyError.includes('Request Timeout') || friendlyError.includes('首包响应等待超时')) {
+    return '模型服务商响应超时，当前排队或模型负荷过高，请检查网络或稍后重试。';
+  }
+  if (friendlyError.includes('socket hang up')) {
+    return '网络连接被意外挂断 (socket hang up)，请检查模型服务商或中转站稳定性。';
+  }
+  if (
+    friendlyError.includes('unexpected EOF') ||
+    friendlyError.includes('stream reading error') ||
+    friendlyError.includes('STREAM_EOF') ||
+    friendlyError.includes('Stream EOF')
+  ) {
+    return '流式传输中途被对端关闭 (unexpected EOF)，通常由中转站/Nginx 的连接超时或反向代理过早断流所致。若已有部分内容输出则已截断保留，可重新发送请求。';
+  }
+  if (friendlyError.includes('aborted')) {
+    return '请求被中断 (aborted)，可能是网络环境不稳定或服务端主动中止，请检查代理设置后重试。';
+  }
+  return friendlyError;
+}
+
 const AT_FILE_EXT = 'docx|xlsx|xls|pdf|doc|pptx|txt|md|json|js|jsx|ts|tsx|mjs|cjs|py|css|html|htm|yml|yaml|xml|csv|sh|ps1|java|go|rs|toml|ini|vue';
 
 /** 从消息里抽出 @路径。支持中文、空格，以及 @"路径" 引号形式。 */
@@ -166,7 +247,68 @@ function localWorkspaceToolsAnthropic(canRead: boolean, canWrite: boolean) {
 
 type CodexToolCall = { id?: string; name: string; arguments: string };
 
-/** 解析标记块兜底：@@@write_file path="a.md"\\n...@@@end */
+/** 安全解析 LLM 返回的响应体：自动兼容标准 JSON、原始 SSE 流式 data: 序列或纯文本，杜绝 Unexpected token 'd' 等异常 */
+function safeParseLlmBody(rawBody: any): any {
+  if (typeof rawBody !== 'string') return rawBody || {};
+  const trimmed = rawBody.trim();
+  if (!trimmed) return {};
+
+  // 1. 若响应为原始 SSE 流式文本 (以 data: 开头或包含换行 data:)，鲁棒提取内容与思考过程
+  if (trimmed.startsWith('data:') || trimmed.includes('\ndata:')) {
+    let accText = '';
+    let accThinking = '';
+    let streamErr: string | null = null;
+    let streamUsage: any = null;
+    const lines = trimmed.split(/\r?\n/);
+    for (const line of lines) {
+      const lineTrim = line.trim();
+      if (!lineTrim.startsWith('data:')) continue;
+      const payload = lineTrim.replace(/^data:\s*/, '');
+      if (payload === '[DONE]') continue;
+      try {
+        const item = JSON.parse(payload);
+        if (item.error) {
+          streamErr = item.error.message || (typeof item.error === 'string' ? item.error : JSON.stringify(item.error));
+        }
+        if (item.usage) streamUsage = item.usage;
+        const choice = item.choices?.[0];
+        const deltaText = choice?.delta?.content || choice?.delta?.text || choice?.text || '';
+        const deltaThinking = choice?.delta?.reasoning_content || choice?.delta?.reasoning || choice?.delta?.thought || '';
+        if (deltaText) accText += deltaText;
+        if (deltaThinking) accThinking += deltaThinking;
+      } catch {
+        // 忽略未解析完成的行
+      }
+    }
+    if (streamErr) {
+      return { error: { message: streamErr } };
+    }
+    return {
+      choices: [{
+        message: {
+          content: accText,
+          reasoning_content: accThinking,
+        }
+      }],
+      usage: streamUsage
+    };
+  }
+
+  // 2. 正常 JSON 解析，若解析失败则兜底为普通文本内容
+  try {
+    return JSON.parse(trimmed);
+  } catch (e) {
+    return {
+      choices: [{
+        message: {
+          content: trimmed
+        }
+      }]
+    };
+  }
+}
+
+/** 解析标记块兜底：@@@write_file path="a.md"\n...@@@end */
 function extractTaggedWriteFiles(text: string): { relativePath: string; content: string }[] {
   const out: { relativePath: string; content: string }[] = [];
   const re = /@@@write_file\s+path=["']([^"']+)["']\s*\r?\n([\s\S]*?)@@@end/gi;
@@ -454,7 +596,10 @@ export const App: React.FC = () => {
     progress: updateProgress,
     isDownloaded: isUpdateDownloaded,
     downloadedVersion,
+    errorMessage: updateErrorMessage,
     startDownload,
+    installNow,
+    installOnQuit,
     closeModal: closeUpdateModal,
     checkForUpdates,
   } = useUpdater();
@@ -483,6 +628,7 @@ export const App: React.FC = () => {
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
   const [lightboxImg, setLightboxImg] = useState<string | null>(null);
   const [inputPrompt, setInputPrompt] = useState('');
+  const [composerImages, setComposerImages] = useState<AttachedImage[]>([]);
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [skillsTabSignal, setSkillsTabSignal] = useState(0);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('workspace-readonly');
@@ -1157,6 +1303,7 @@ export const App: React.FC = () => {
             stream: true,
             max_tokens: effectiveMaxTokens,
             messages: contextMessages,
+            stream_options: { include_usage: true },
             ...(oTools.length ? { tools: oTools, tool_choice: 'auto' } : {})
           };
         } else {
@@ -1173,6 +1320,7 @@ export const App: React.FC = () => {
             stream: true,
             max_tokens: effectiveMaxTokens,
             messages: contextMessages,
+            stream_options: { include_usage: true },
             ...(oTools.length ? { tools: oTools, tool_choice: 'auto' } : {})
           };
         }
@@ -1187,13 +1335,31 @@ export const App: React.FC = () => {
         });
 
         if (rawRes && rawRes.ok) {
-          const parsed = typeof rawRes.body === 'string' ? JSON.parse(rawRes.body) : rawRes.body;
+          if (typeof rawRes.body === 'string') {
+            const trimmedBody = rawRes.body.trim();
+            if (
+              trimmedBody.startsWith('<!DOCTYPE') ||
+              trimmedBody.startsWith('<!doctype') ||
+              trimmedBody.startsWith('<html') ||
+              trimmedBody.includes('<head>')
+            ) {
+              throw new Error(
+                '⚠️ 配置错误: API 接口返回了网页 (HTML) 而非 JSON。通常是因为 Base URL 缺少 /v1 路径前缀，请在设置中检查并补充。'
+              );
+            }
+          }
+          const parsed = safeParseLlmBody(rawRes.body);
 
           // 提取真实 usage 指标并计算最终结算速率
-          const usage = parsed?.usage;
-          const realInputTokens = usage?.prompt_tokens ?? estimatedInputTokens;
-          const realOutputTokens = usage?.completion_tokens ?? Math.max(1, Math.round(accumulatedChars / 2.2));
-          const cachedTokens = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cached_tokens ?? null;
+          const {
+            realInputTokens,
+            realOutputTokens,
+            cachedTokens,
+          } = extractUsageTokens(
+            parsed?.usage,
+            estimatedInputTokens,
+            Math.max(1, Math.round(accumulatedChars / 2.2))
+          );
           const cacheHit = cachedTokens && realInputTokens > 0 ? Math.round((cachedTokens / realInputTokens) * 100) : null;
           const finalDurationSec = Math.max(0.1, (Date.now() - (firstTokenTime || sendStartTime)) / 1000);
           const finalTps = Math.round(realOutputTokens / finalDurationSec);
@@ -1208,16 +1374,26 @@ export const App: React.FC = () => {
           });
 
           if (effectiveProtocol === 'anthropic') {
-            const text = (parsed.content || []).map((c: any) => c.text || '').join('');
-            const thinking = (parsed.content || []).filter((c: any) => c.type === 'thinking').map((c: any) => c.thinking).join('\n');
+            const blocks = Array.isArray(parsed.content) ? parsed.content : [];
+            let text = blocks.map((c: any) => c.text || '').join('');
+            let thinking = blocks.filter((c: any) => c.type === 'thinking').map((c: any) => c.thinking).join('\n');
+            // 双读：主进程流式收尾可能只组了 OpenAI choices
+            if (!text && !thinking) {
+              const choice = parsed.choices?.[0];
+              text = choice?.message?.content || '';
+              thinking = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
+            }
             response = { content: text, thinking };
-            const anthropicTools = (parsed.content || [])
+            let anthropicTools = blocks
               .filter((c: any) => c.type === 'tool_use' && c.name)
               .map((c: any) => ({
                 id: c.id,
                 name: c.name,
                 arguments: typeof c.input === 'string' ? c.input : JSON.stringify(c.input || {}),
               }));
+            if (!anthropicTools.length && Array.isArray(parsed.codex_tool_calls) && parsed.codex_tool_calls.length) {
+              anthropicTools = parsed.codex_tool_calls;
+            }
             if (anthropicTools.length) collectedToolCalls = anthropicTools;
           } else {
             const choice = parsed.choices?.[0];
@@ -1404,6 +1580,7 @@ export const App: React.FC = () => {
                     stream: true,
                     max_tokens: effectiveMaxTokens,
                     messages: roundMessages,
+                    stream_options: { include_usage: true },
                     ...(contOTools.length ? { tools: contOTools, tool_choice: 'auto' } : {}),
                   };
                 }
@@ -1419,9 +1596,11 @@ export const App: React.FC = () => {
 
                 if (!contRes?.ok) break;
 
-                const contParsed = typeof contRes.body === 'string' ? JSON.parse(contRes.body) : contRes.body;
+                const contParsed = safeParseLlmBody(contRes.body);
                 if (effectiveProtocol === 'anthropic') {
-                  const text = (contParsed.content || []).map((c: any) => c.text || '').join('');
+                  const blocks = Array.isArray(contParsed.content) ? contParsed.content : [];
+                  let text = blocks.map((c: any) => c.text || '').join('');
+                  if (!text) text = contParsed.choices?.[0]?.message?.content || '';
                   if (!contContentAcc && text) {
                     contContentAcc = text;
                     updateLastMessageInCurrentSession((prev) => ({
@@ -1429,13 +1608,16 @@ export const App: React.FC = () => {
                       content: `${prev.content || ''}${text}`,
                     }));
                   }
-                  const anthropicTools = (contParsed.content || [])
+                  let anthropicTools = blocks
                     .filter((c: any) => c.type === 'tool_use' && c.name)
                     .map((c: any) => ({
                       id: c.id,
                       name: c.name,
                       arguments: typeof c.input === 'string' ? c.input : JSON.stringify(c.input || {}),
                     }));
+                  if (!anthropicTools.length && Array.isArray(contParsed.codex_tool_calls)) {
+                    anthropicTools = contParsed.codex_tool_calls;
+                  }
                   if (anthropicTools.length) contToolCalls = anthropicTools;
                 } else {
                   const choice = contParsed.choices?.[0];
@@ -1578,6 +1760,7 @@ export const App: React.FC = () => {
                     stream: true,
                     max_tokens: effectiveMaxTokens,
                     messages: roundMessages,
+                    stream_options: { include_usage: true },
                   };
                 }
 
@@ -1591,30 +1774,28 @@ export const App: React.FC = () => {
                 });
 
                 if (closeRes?.ok) {
-                  try {
-                    const closeParsed = typeof closeRes.body === 'string' ? JSON.parse(closeRes.body) : closeRes.body;
-                    if (effectiveProtocol === 'anthropic') {
-                      const text = (closeParsed.content || []).map((c: any) => c.text || '').join('');
-                      if (!closeContentAcc && text) {
-                        updateLastMessageInCurrentSession((prev) => ({
-                          ...prev,
-                          content: `${prev.content || ''}${text}`,
-                        }));
-                      }
-                      if (closeParsed.stop_reason) streamFinishReason = String(closeParsed.stop_reason);
-                    } else {
-                      const choice = closeParsed.choices?.[0];
-                      const text = choice?.message?.content || '';
-                      if (!closeContentAcc && text) {
-                        updateLastMessageInCurrentSession((prev) => ({
-                          ...prev,
-                          content: `${prev.content || ''}${text}`,
-                        }));
-                      }
-                      if (choice?.finish_reason) streamFinishReason = String(choice.finish_reason);
+                  const closeParsed = safeParseLlmBody(closeRes.body);
+                  if (effectiveProtocol === 'anthropic') {
+                    const blocks = Array.isArray(closeParsed.content) ? closeParsed.content : [];
+                    let text = blocks.map((c: any) => c.text || '').join('');
+                    if (!text) text = closeParsed.choices?.[0]?.message?.content || '';
+                    if (!closeContentAcc && text) {
+                      updateLastMessageInCurrentSession((prev) => ({
+                        ...prev,
+                        content: `${prev.content || ''}${text}`,
+                      }));
                     }
-                  } catch {
-                    /* 流式已增量写入 */
+                    if (closeParsed.stop_reason) streamFinishReason = String(closeParsed.stop_reason);
+                  } else {
+                    const choice = closeParsed.choices?.[0];
+                    const text = choice?.message?.content || '';
+                    if (!closeContentAcc && text) {
+                      updateLastMessageInCurrentSession((prev) => ({
+                        ...prev,
+                        content: `${prev.content || ''}${text}`,
+                      }));
+                    }
+                    if (choice?.finish_reason) streamFinishReason = String(choice.finish_reason);
                   }
                   lastApiToolCalls = [];
                 }
@@ -1669,40 +1850,25 @@ export const App: React.FC = () => {
       }
     } catch (err: any) {
       let rawMsg = err.message || '网络连接超时或提供方异常';
-      let friendlyError = rawMsg;
 
-      try {
-        const parsed = JSON.parse(rawMsg);
-        const innerMsg = parsed?.error?.message || parsed?.message || parsed?.error;
-        if (typeof innerMsg === 'string') {
-          friendlyError = innerMsg;
+      if (typeof rawMsg === 'string' && (rawMsg.startsWith('data:') || rawMsg.includes('\ndata:'))) {
+        const parsedSse = safeParseLlmBody(rawMsg);
+        if (parsedSse?.error?.message) {
+          rawMsg = parsedSse.error.message;
         }
-      } catch {
-        // 保持原样
       }
 
-      if (friendlyError.includes('ECONNRESET')) {
-        friendlyError = '网络连接被服务商/代理强行重置 (read ECONNRESET)。已自动重试 2 次仍未连通，通常为模型服务商网关抖动或网络代理切断，建议稍后重试。';
-      } else if (friendlyError.includes('ETIMEDOUT') || friendlyError.includes('Request Timeout') || friendlyError.includes('首包响应等待超时')) {
-        friendlyError = '模型服务商响应超时，当前排队或模型负荷过高，请检查网络或稍后重试。';
-      } else if (friendlyError.includes('socket hang up')) {
-        friendlyError = '网络连接被意外挂断 (socket hang up)，请检查模型服务商或中转站稳定性。';
-      } else if (
-        friendlyError.includes('unexpected EOF') ||
-        friendlyError.includes('stream reading error') ||
-        friendlyError.includes('STREAM_EOF') ||
-        friendlyError.includes('Stream EOF')
-      ) {
-        friendlyError = '流式传输中途被对端关闭 (unexpected EOF)，通常由中转站/Nginx 的连接超时或反向代理过早断流所致。若已有部分内容输出则已截断保留，可重新发送请求。';
-      } else if (friendlyError.includes('aborted')) {
-        friendlyError = '请求被中断 (aborted)，可能是网络环境不稳定或服务端主动中止，请检查代理设置后重试。';
-      }
+      const friendlyError = formatLlmFailureMessage(rawMsg);
+      const isTransportFailure =
+        !/Unexpected token|is not valid JSON|JSON\.parse|配置错误|响应体解析失败/i.test(rawMsg) &&
+        !/配置错误|响应体解析失败/i.test(friendlyError);
+      const failureLabel = isTransportFailure ? '❌ [传输中断]' : '❌ 请求失败';
 
       updateLastMessageInCurrentSession(prev => ({
         ...prev,
         content: prev.content
-          ? `${prev.content}\n\n❌ [传输中断]: ${friendlyError}`
-          : `❌ 请求失败: ${friendlyError}`,
+          ? `${prev.content}\n\n${failureLabel}: ${friendlyError}`
+          : `${failureLabel}: ${friendlyError}`,
         thinking: '执行异常',
       }));
     } finally {
@@ -1784,7 +1950,14 @@ export const App: React.FC = () => {
           onMoveSessionToWorkspace={moveSessionToWorkspace}
           onDeleteSession={deleteSession}
           onRenameSession={renameSession}
-          onInsertPrompt={(text) => setInputPrompt(prev => prev ? `${prev} ${text}` : text)}
+          onInsertPrompt={(text) => {
+            const formatted = text.endsWith(' ') ? text : `${text} `;
+            setInputPrompt(prev => {
+              if (!prev) return formatted;
+              if (prev.endsWith(' ')) return `${prev}${formatted}`;
+              return `${prev} ${formatted}`;
+            });
+          }}
           onSelectFile={handleSelectFile}
           onOpenSettings={() => setIsSettingsOpen(true)}
           onOpenTheme={() => setIsThemeOpen(true)}
@@ -1897,10 +2070,12 @@ export const App: React.FC = () => {
             permissionMode={permissionMode}
             onSelectPermissionMode={handleSelectPermissionMode}
             currentSessionId={currentSessionId}
+            attachedImages={composerImages}
+            onImagesChange={setComposerImages}
           />
         </main>
 
-        {/* 右侧变更预览面板 (支持源码/Diff双模式与一键还原) */}
+        {/* 右侧变更预览面板 (支持阅读/源码/Diff多模式与一键还原) */}
         <PreviewPanel
           isOpen={isPreviewOpen}
           onClose={() => setIsPreviewOpen(false)}
@@ -1910,7 +2085,20 @@ export const App: React.FC = () => {
           originalContent={previewFile?.originalContent}
           hasBackup={previewFile?.hasBackup}
           onRevert={handleRevertFile}
-          onInsertToPrompt={(text) => setInputPrompt(prev => prev ? `${prev} ${text}` : text)}
+          onAttachImage={(img) => {
+            setComposerImages((prev) => [
+              ...prev,
+              { base64: img.dataUrl, path: img.name },
+            ]);
+          }}
+          onInsertToPrompt={(text) => {
+            const formatted = text.endsWith(' ') ? text : `${text} `;
+            setInputPrompt(prev => {
+              if (!prev) return formatted;
+              if (prev.endsWith(' ')) return `${prev}${formatted}`;
+              return `${prev} ${formatted}`;
+            });
+          }}
         />
       </div>
 
@@ -1959,7 +2147,10 @@ export const App: React.FC = () => {
         progress={updateProgress}
         isDownloaded={isUpdateDownloaded}
         downloadedVersion={downloadedVersion}
+        errorMessage={updateErrorMessage}
         onStartDownload={startDownload}
+        onInstallNow={installNow}
+        onInstallOnQuit={installOnQuit}
       />
 
       <ImageLightbox

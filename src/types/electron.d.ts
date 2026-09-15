@@ -156,6 +156,48 @@ export interface WorkspaceTreeResult {
   error?: string;
 }
 
+export type RichBlockType = 'heading' | 'paragraph' | 'math-block' | 'table' | 'image';
+
+export interface RichInlineRun {
+  type: 'text' | 'math' | 'bold' | 'italic';
+  text: string;
+}
+
+export interface RichDocumentBlock {
+  type: RichBlockType;
+  level?: number;
+  text?: string;
+  runs?: RichInlineRun[];
+  latex?: string;
+  tableData?: string[][];
+  image?: {
+    id: string;
+    name: string;
+    dataUrl: string;
+    alt?: string;
+  };
+}
+
+export interface DocxRichDocument {
+  title?: string;
+  blocks: RichDocumentBlock[];
+  imagesCount: number;
+  mathCount: number;
+}
+
+export interface ReadRichDocumentResult {
+  ok: boolean;
+  type?: 'docx' | 'pdf';
+  relativePath?: string;
+  fullPath?: string;
+  richDocument?: DocxRichDocument;
+  base64?: string;
+  totalBytes?: number;
+  code?: string;
+  reason?: string;
+  hint?: string;
+}
+
 export interface CodexDesktopAPI {
   getAppInfo: () => Promise<AppInfo>;
   getSkills: () => Promise<SkillItem[]>;
@@ -244,6 +286,7 @@ export interface CodexDesktopAPI {
     error?: string;
     code?: string;
   }>;
+  readRichDocument?: (relativePath: string) => Promise<ReadRichDocumentResult>;
   writeWorkspaceFile?: (payload: { relativePath: string; content: string; createBackup?: boolean }) => Promise<WriteWorkspaceFileResult>;
   readWorkspaceFileDiff?: (relativePath: string) => Promise<ReadWorkspaceFileDiffResult>;
   revertWorkspaceFile?: (relativePath: string) => Promise<RevertWorkspaceFileResult>;
@@ -262,8 +305,11 @@ export interface CodexDesktopAPI {
   onUpdateAvailable: (callback: (info: UpdateInfo) => void) => void;
   onUpdateDownloading: (callback: () => void) => void;
   onUpdateProgress: (callback: (progress: UpdateProgress) => void) => void;
-  onUpdateDownloaded: (callback: (res: { version: string; filePath: string }) => void) => void;
-  onUpdateError: (callback: (err: { message: string }) => void) => void;
+  onUpdateDownloaded: (callback: (res: { version: string; filePath?: string; installerPath?: string }) => void) => void;
+  onUpdateError: (callback: (err: { message?: string; error?: string }) => void) => void;
+  applyUpdateNow?: () => Promise<{ success: boolean }>;
+  applyUpdateOnQuit?: () => Promise<{ success: boolean; pending: boolean }>;
+  onUpdatePendingOnQuit?: (callback: (data: { version: string }) => void) => void;
 }
 
 declare global {

@@ -19,6 +19,7 @@
 - **Workspace Tools (模型工具)**：`read_workspace_file` 只收相对路径，纯对话不挂载。`write_workspace_file` 负责写盘。`.docx` 与文字型 PDF 抽取正文；`.xlsx` / `.xls` / `.doc` / `.pptx` 拒绝。流正常结束不是「传输中断」。空正文不要当成 API Key 错误。
 - **Abort & Rollback (中断与撤回机制)**：模型流式生成时可物理切断网络 (`req.destroy()`)，用户提问支持一键成对撤回并原样回填至输入框重发。
 - **Cross-platform Guardrails & Skill Audit (跨平台护栏与技能扫描)**：内置零外部依赖跨平台 Git 拦截护栏与 43 项技能静态健康扫描器，守卫工程资产与操作安全。
+- **Rich Document Pipeline (文档多模态与公式引擎)**：对齐学术论文与工业规范场景。主进程内置零依赖 OMML-to-LaTeX 转译器与媒体抽取器，前端集成 KaTeX 与 Canvas 视图，在右侧面板实现 Word/PDF 图文公式原生排版，并支持“一键引图入会话”无缝接入视觉大模型。
 
 ---
 
@@ -36,12 +37,12 @@
 | **Seam 9** | 多模型服务商 | `src/hooks/useProviders.ts`, `main.js` | 多协议自适应、API Key 安全落盘与连通性测试 |
 | **Seam 10** | 原生多模态 | `preload.js`, `ui/app.js` | 剪贴板图片拦截 (Ctrl+V)、安全落盘与视觉模型直接传图 |
 | **Seam 11~11.6** | 交互辅助与解析 | `ui/app.js`, `tests/` | ESC 关闭模态框、LLM 返回 HTML 网页防误判、VM 状态机验证 |
-| **Seam 12~13** | 打包与自动更新 | `scripts/release.mjs`, `main.js` | NSIS 安装包构建、SHA-256 归档、GitHub Releases 流式下载 |
+| **Seam 12~13** | 打包与自动更新 | `.github/workflows/release.yml`, `scripts/release.mjs`, `main.js` | GitHub Actions 云端构建、NSIS `/S` 静默覆盖更新、镜像加速与 ADR 0001 决策记录 |
 | **Seam 14** | 官方内核对齐 | `main.js`, `ui/app.js` | 官方 Codex CLI `v0.152.1` 状态检测与 2026 旗舰模型矩阵 |
 | **Seam 15** | Tab Queueing | `src/components/Composer/`, `hooks/useTabQueue.ts` | 异步非阻塞指令排队、UI 状态指示条与流水线调度 |
 | **Seam 16** | Slash Commands | `src/components/Composer/`, `ui/app.js` | 原生 `/status`, `/diff`, `/skills`, `/clear`, `/help` 指令调度 |
 | **Seam 17** | 主进程权威安全沙箱 | `main.js`, `tests/workspace-security.test.mjs` | 路径穿透/软链接逃逸防御、二进制嗅探拦截、四种权限与物理 `.bak` 备份 |
-| **Seam 18** | 流式中断、撤回与模型工具 | `main.js`, `src/App.tsx`, `src/hooks/useSessions.ts` | 物理掐断活跃 HTTP 连接、成对撤回问答；读/写工具与正文抽取 |
+| **Seam 18** | 流式中断、撤回、模型工具与 @ 原子删除 | `main.js`, `src/App.tsx`, `src/hooks/useSessions.ts`, `src/utils/mention.ts` | 物理掐断活跃 HTTP 连接、成对撤回问答；读/写工具与正文抽取；@ 文件引用整体删除 |
 
 ---
 

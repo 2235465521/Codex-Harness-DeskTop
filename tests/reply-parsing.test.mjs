@@ -106,4 +106,17 @@ export function runReplyParsingTests() {
     lastChunk = t;
   }
   assert.strictEqual(didTimeout, false, "只要数据流持续涌现，120s 长任务绝对不会触发空闲超时");
+
+  // 9) SSE 数据流原始格式解析 (防止 Unexpected token 'd' 报错)
+  const sseBody = 'data: {"choices":[{"delta":{"content":"这是GLM流式文本","reasoning_content":"深度思考完成"}}]}\n\ndata: [DONE]\n\n';
+  const sseResult = parse({ ok: true, status: 200, statusText: "OK", body: sseBody }, "https://example.com/v1/chat/completions", "glm-5.3", "0.8");
+  assert.strictEqual(sseResult.ok, true, "SSE 原始数据行必须正常解析为成功");
+  assert.strictEqual(sseResult.content, "这是GLM流式文本");
+  assert.strictEqual(sseResult.thinking, "深度思考完成");
+
+  // 10) SSE 数据流内部包含错误
+  const sseErrBody = 'data: {"error":{"message":"模型额度已耗尽，请充值后重试"}}\n\n';
+  const sseErrResult = parse({ ok: false, status: 400, statusText: "Bad Request", body: sseErrBody }, "https://example.com/v1/chat/completions", "glm-5.3", "0.3");
+  assert.strictEqual(sseErrResult.ok, false);
+  assert.ok(sseErrResult.content.includes("模型额度已耗尽"), "SSE 错误信息应准确提取");
 }

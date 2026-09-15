@@ -205,6 +205,7 @@ contextBridge.exposeInMainWorld("codexDesktop", {
   readWorkspaceFile: (relativePath) => ipcRenderer.invoke("read-workspace-file", { relativePath }),
   extractDocxText: (payload) => ipcRenderer.invoke("extract-docx-text", payload),
   extractPdfText: (payload) => ipcRenderer.invoke("extract-pdf-text", payload),
+  readRichDocument: (relativePath) => ipcRenderer.invoke("read-rich-document", { relativePath }),
   writeWorkspaceFile: (payload) => ipcRenderer.invoke("write-workspace-file", payload),
   readWorkspaceFileDiff: (relativePath) => ipcRenderer.invoke("read-workspace-file-diff", { relativePath }),
   revertWorkspaceFile: (relativePath) => ipcRenderer.invoke("revert-workspace-file", { relativePath }),
@@ -225,6 +226,14 @@ contextBridge.exposeInMainWorld("codexDesktop", {
   },
   onUpdateDownloaded: (callback) => {
     ipcRenderer.on("update-downloaded", (_event, data) => callback(data));
+  },
+  applyUpdateNow: () => ipcRenderer.invoke("apply-update-now"),
+  applyUpdateOnQuit: () => ipcRenderer.invoke("apply-update-on-quit"),
+  onUpdatePendingOnQuit: (callback) => {
+    ipcRenderer.on("update-pending-on-quit", (_event, data) => callback(data));
+  },
+  onUpdateError: (callback) => {
+    ipcRenderer.on("update-error", (_event, data) => callback(data));
   }
 });
 

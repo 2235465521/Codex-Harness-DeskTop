@@ -4,6 +4,7 @@ import { AttachedImage, QueuedInstruction } from '@/types/session';
 import { ModelOption } from '@/types/provider';
 import { SkillItem, PermissionMode } from '@/types/electron';
 import { getSkillDisplayInfo, SKILLS_DICTIONARY } from '@/data/skillsDictionary';
+import { handleAtMentionDeletion } from '@/utils/mention';
 
 interface ComposerProps {
   onSend: (text: string, images: AttachedImage[]) => void;
@@ -20,6 +21,8 @@ interface ComposerProps {
   permissionMode: PermissionMode;
   onSelectPermissionMode: (mode: PermissionMode) => void;
   currentSessionId?: string | null;
+  attachedImages?: AttachedImage[];
+  onImagesChange?: (images: AttachedImage[]) => void;
 }
 
 const SLASH_COMMANDS = [
@@ -134,8 +137,19 @@ export const Composer: React.FC<ComposerProps> = ({
   permissionMode,
   onSelectPermissionMode,
   currentSessionId,
+  attachedImages,
+  onImagesChange,
 }) => {
-  const [images, setImages] = useState<AttachedImage[]>([]);
+  const [internalImages, setInternalImages] = useState<AttachedImage[]>([]);
+  const images = attachedImages !== undefined ? attachedImages : internalImages;
+  const setImages = (action: React.SetStateAction<AttachedImage[]>) => {
+    if (attachedImages !== undefined && onImagesChange) {
+      const next = typeof action === 'function' ? (action as any)(attachedImages) : action;
+      onImagesChange(next);
+    } else {
+      setInternalImages(action);
+    }
+  };
   const [textFiles, setTextFiles] = useState<AttachedTextFile[]>([]);
   const [attachHint, setAttachHint] = useState<string | null>(null);
 
@@ -150,6 +164,7 @@ export const Composer: React.FC<ComposerProps> = ({
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const permissionPickerRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
+  const pendingCursorPosRef = useRef<number | null>(null);
 
   // 全局点击空白区域与按 ESC 键自动收起模型选择和快捷指令卡片
   useEffect(() => {
@@ -181,12 +196,18 @@ export const Composer: React.FC<ComposerProps> = ({
     };
   }, []);
 
-  // 动态自适应输入框高度
+  // 动态自适应输入框高度与光标位置精准还原
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       const scrollHeight = textareaRef.current.scrollHeight;
       textareaRef.current.style.height = `${Math.min(scrollHeight, 140)}px`;
+
+      if (pendingCursorPosRef.current !== null) {
+        const pos = pendingCursorPosRef.current;
+        pendingCursorPosRef.current = null;
+        textareaRef.current.setSelectionRange(pos, pos);
+      }
     }
   }, [inputPrompt]);
 
@@ -194,6 +215,26 @@ export const Composer: React.FC<ComposerProps> = ({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+      return;
+    }
+
+    // 原子化删除 @ 引用：当按下退格键或 Delete 键时，将整段 @ 路径整体剔除
+    if (e.key === 'Backspace' || e.key === 'Delete') {
+      const textarea = textareaRef.current;
+      if (textarea && textarea.selectionStart === textarea.selectionEnd) {
+        const result = handleAtMentionDeletion(inputPrompt, textarea.selectionStart, e.key);
+        if (result) {
+          e.preventDefault();
+          pendingCursorPosRef.current = result.newCursorPos;
+          setInputPrompt(result.newText);
+          requestAnimationFrame(() => {
+            if (textareaRef.current) {
+              textareaRef.current.setSelectionRange(result.newCursorPos, result.newCursorPos);
+            }
+          });
+          return;
+        }
+      }
     }
   };
 
