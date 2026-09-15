@@ -219,6 +219,7 @@ export interface CodexDesktopAPI {
     contentDelta?: string;
     thinkingDelta?: string;
     isDone?: boolean;
+    finishReason?: string;
     toolCalls?: { id?: string; name: string; arguments: string }[];
   }) => void) => () => void;
   abortLlmStream?: (streamId: string) => Promise<{ success: boolean; notFound?: boolean }>;

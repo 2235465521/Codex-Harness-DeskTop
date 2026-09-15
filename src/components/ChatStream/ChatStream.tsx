@@ -18,6 +18,7 @@ interface ChatStreamProps {
   onRevokeMessage?: (messageIndex: number) => void;
   onOpenFileDiff?: (filePath: string) => void;
   onRevertFile?: (filePath: string) => Promise<void> | void;
+  onContinueGeneration?: () => void;
 }
 
 export const ChatStream: React.FC<ChatStreamProps> = ({
@@ -31,6 +32,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
   onRevokeMessage,
   onOpenFileDiff,
   onRevertFile,
+  onContinueGeneration,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const streamEndRef = useRef<HTMLDivElement>(null);
@@ -269,7 +271,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
             // 助手回复（通栏纯净排版、思考/工作时间折叠栏、细分隔线、底部微图标操作区）
             const workSeconds = (isGenerating && isLastMessage)
               ? liveElapsedSeconds
-              : Math.max(1, Math.round((msg.thinking?.length || 120) / 45));
+              : Math.max(1, msg.workDurationSec || 1);
 
             return (
               <React.Fragment key={idx}>
@@ -305,6 +307,22 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                           {msg.thinking}
                         </div>
                       )}
+                    </div>
+                  )}
+
+                  {msg.earlyEnded && !isGenerating && isLastMessage && onContinueGeneration && (
+                    <div className="flex flex-col items-start gap-1.5 w-full">
+                      <p className="text-[12px] text-amber-600/90 dark:text-amber-400/90 leading-snug">
+                        ⚠️ [输出提前结束] 上游正常关流或输出额度用尽，不是网络传输中断。可点下方「继续生成」接上未完成内容。
+                      </p>
+                      <button
+                        type="button"
+                        onClick={onContinueGeneration}
+                        className="inline-flex items-center gap-1.5 text-[12px] px-2.5 py-1 rounded-md border border-amber-500/40 text-amber-600 dark:text-amber-400 hover:bg-amber-500/10 transition-colors"
+                      >
+                        <RotateCcw size={12} />
+                        <span>继续生成</span>
+                      </button>
                     </div>
                   )}
 

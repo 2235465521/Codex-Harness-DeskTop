@@ -10,12 +10,13 @@
 - **Core CLI / Daemon**：底层遵循 OpenAI 官方最新 **Codex CLI (`@openai/codex` v0.152.1)** 规范，支持本地环境探测与命令行能力。
 - **Session (会话)**：独立对话单元，包含多轮历史消息、关联模型配置与专属指令排队队列 (`queuedInstructions`)，支持持久化到 `localStorage`。
 - **Tab Queueing (指令流水线)**：官方前沿交互特性。当 Agent 正处于思考/生成回复期间，用户新输入的指令进入排队队列，当前任务完成后自动顺延触发。
-- **Skills (技能生态)**：43 项预置工程技能（包含 35 项 Matt Pocock 工业级技能 + 8 项 Loop Engineering 循环工程技能），启动时自动增量部署至 `~/.codex/skills/`。用户自定义技能规划见 `contexts/implement-user-skills.md`（权威目录拟为 `~/.codex/user-skills/`，MVP 待执行）。
+- **Skills (技能生态)**：43 项预置工程技能（35 项工业级 + 8 项 Loop Engineering），启动时增量同步至 `~/.codex/skills/`。用户技能在 `~/.codex/user-skills/`，与内置热同步隔离，侧栏可导入、新建、编辑、删除。
 - **Provider Presets (提供方预设)**：内置 OpenAI (旗舰 `gpt-5.6-sol`, `gpt-5.4-mini`)、Anthropic (`claude-3-7-sonnet` 混合思考)、DeepSeek (`deepseek-reasoner`) 与本地 Ollama 协议适配。
 - **Themes (主题引擎)**：4 款 VS Code 经典极客美学高对比度配色（`escook Dark`, `Dark Soft`, `Light`, `Light Soft`），支持快捷键与菜单毫秒级热切换。
 - **Workspace Grouping (项目归类与联动)**：对话按真实工程物理目录收纳，切换对话自动联动切换当前全局工作区、主进程环境与代码树，使用 `normalizeFsPath` 保证跨平台一致性。
 - **Streaming Telemetry (真实流式遥测)**：实时监控 TTFT (首 Token 耗时)、实时吐字速率 (tok/s)、真实输入/输出 Token 统计与上下文缓存命中率 (Cache Hit %)，消除任何静态假数据。
-- **Security Sandbox (主进程安全沙箱)**：守卫 `chat-only`、`workspace-readonly`、`workspace-readwrite` 三级权限，防护目录穿透与软链接逃逸，写回代码自动保留 `.bak` 备份。
+- **Security Sandbox (主进程安全沙箱)**：守卫 `chat-only`、`workspace-readonly`、`workspace-readwrite`、`full-access` 四种权限。只读/读写阻断 `../`、绝对路径越权与软链接逃逸。写回自动保留 `.bak`。
+- **Workspace Tools (模型工具)**：`read_workspace_file` 只收相对路径，纯对话不挂载。`write_workspace_file` 负责写盘。`.docx` 与文字型 PDF 抽取正文；`.xlsx` / `.xls` / `.doc` / `.pptx` 拒绝。流正常结束不是「传输中断」。空正文不要当成 API Key 错误。
 - **Abort & Rollback (中断与撤回机制)**：模型流式生成时可物理切断网络 (`req.destroy()`)，用户提问支持一键成对撤回并原样回填至输入框重发。
 - **Cross-platform Guardrails & Skill Audit (跨平台护栏与技能扫描)**：内置零外部依赖跨平台 Git 拦截护栏与 43 项技能静态健康扫描器，守卫工程资产与操作安全。
 
@@ -32,25 +33,25 @@
 | **Seam 7** | 主题美学引擎 | `preload.js`, `ui/style.css` | 4 款配色 CSS 变量注入、高对比度与无缝热切换 |
 | **Seam 8** | 技能库部署 | `main.js`, `.agents/skills/` | 43 项技能双目录增量热同步、YAML Frontmatter 校验 |
 | **Seam 8.5** | 技能健康静态扫描 | `scripts/check-skills.mjs` | 43 项技能元数据非空、YAML 缩进防 Tab 与提示词语法合规断言 |
-| **Seam 9** | 多模型服务商 | `ui/app.js`, `main.js` | 多协议自适应、API Key 安全落盘与连通性测试 |
+| **Seam 9** | 多模型服务商 | `src/hooks/useProviders.ts`, `main.js` | 多协议自适应、API Key 安全落盘与连通性测试 |
 | **Seam 10** | 原生多模态 | `preload.js`, `ui/app.js` | 剪贴板图片拦截 (Ctrl+V)、安全落盘与视觉模型直接传图 |
 | **Seam 11~11.6** | 交互辅助与解析 | `ui/app.js`, `tests/` | ESC 关闭模态框、LLM 返回 HTML 网页防误判、VM 状态机验证 |
 | **Seam 12~13** | 打包与自动更新 | `scripts/release.mjs`, `main.js` | NSIS 安装包构建、SHA-256 归档、GitHub Releases 流式下载 |
 | **Seam 14** | 官方内核对齐 | `main.js`, `ui/app.js` | 官方 Codex CLI `v0.152.1` 状态检测与 2026 旗舰模型矩阵 |
 | **Seam 15** | Tab Queueing | `src/components/Composer/`, `hooks/useTabQueue.ts` | 异步非阻塞指令排队、UI 状态指示条与流水线调度 |
 | **Seam 16** | Slash Commands | `src/components/Composer/`, `ui/app.js` | 原生 `/status`, `/diff`, `/skills`, `/clear`, `/help` 指令调度 |
-| **Seam 17** | 主进程权威安全沙箱 | `main.js`, `tests/workspace-security.test.mjs` | 路径穿透/软链接逃逸防御、二进制嗅探拦截、三级权限模式与物理 `.bak` 备份 |
-| **Seam 18** | 流式中断与撤回状态机 | `main.js`, `src/App.tsx`, `src/hooks/useSessions.ts` | 物理掐断活跃 HTTP 连接、成对抹去问答轮次并一键回填 Prompt 修改重发 |
+| **Seam 17** | 主进程权威安全沙箱 | `main.js`, `tests/workspace-security.test.mjs` | 路径穿透/软链接逃逸防御、二进制嗅探拦截、四种权限与物理 `.bak` 备份 |
+| **Seam 18** | 流式中断、撤回与模型工具 | `main.js`, `src/App.tsx`, `src/hooks/useSessions.ts` | 物理掐断活跃 HTTP 连接、成对撤回问答；读/写工具与正文抽取 |
 
 ---
 
 ## 3. 关键文件索引
 
-- 🚪 **主入口**：[main.js](file:///d:/code_files/get_files/codex-desktop/main.js)
-- 🌉 **桥接层**：[preload.js](file:///d:/code_files/get_files/codex-desktop/preload.js)
-- 🖥️ **工作台 UI**：[ui/index.html](file:///d:/code_files/get_files/codex-desktop/ui/index.html) · [ui/app.js](file:///d:/code_files/get_files/codex-desktop/ui/app.js) · [ui/style.css](file:///d:/code_files/get_files/codex-desktop/ui/style.css)
-- 🧪 **测试套件**：[tests/run-all-tests.mjs](file:///d:/code_files/get_files/codex-desktop/tests/run-all-tests.mjs) · [tests/workspace-security.test.mjs](file:///d:/code_files/get_files/codex-desktop/tests/workspace-security.test.mjs) · [tests/interaction-features.test.mjs](file:///d:/code_files/get_files/codex-desktop/tests/interaction-features.test.mjs)
-- 🔍 **技能健康扫描器**：[scripts/check-skills.mjs](file:///d:/code_files/get_files/codex-desktop/scripts/check-skills.mjs)
-- 📋 **技能生态指南**：[.agents/skills/README.md](file:///d:/code_files/get_files/codex-desktop/.agents/skills/README.md)
-- 📦 **发版流水线**：[scripts/release.mjs](file:///d:/code_files/get_files/codex-desktop/scripts/release.mjs)
-- 📖 **智能体指南**：[AGENTS.md](file:///d:/code_files/get_files/codex-desktop/AGENTS.md)
+- 🚪 **主入口**：`main.js`
+- 🌉 **桥接层**：`preload.js`
+- 🖥️ **工作台**：`src/App.tsx`（`npm start` 加载 `ui/dist`；`ui/app.js` 只是备用静态页）
+- 🧪 **测试**：`tests/run-all-tests.mjs`、`tests/workspace-security.test.mjs`、`tests/interaction-features.test.mjs`
+- 🔍 **技能健康扫描**：`scripts/check-skills.mjs`
+- 📋 **技能说明**：`.agents/skills/README.md`
+- 📦 **发版**：`scripts/release.mjs`
+- 📖 **智能体指南**：`AGENTS.md`

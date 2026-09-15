@@ -186,6 +186,34 @@ export function runInteractionFeaturesTests() {
     assert.ok(app.includes("docx|pdf"), "@ 挂载 PDF 时必须标明已抽取正文");
     assert.ok(!/ext === '\.pdf'/.test(composer), "PDF 不得再被当成无法读取的办公格式拒绝");
   });
+
+  test("流式结束原因与工作耗时: finishReason 回传、提前结束文案、禁止字数估时", () => {
+    const mainJs = fs.readFileSync(path.join(rootDir, "main.js"), "utf8");
+    const app = fs.readFileSync(path.join(rootDir, "src", "App.tsx"), "utf8");
+    const chat = fs.readFileSync(path.join(rootDir, "src", "components", "ChatStream", "ChatStream.tsx"), "utf8");
+    const sessionTs = fs.readFileSync(path.join(rootDir, "src", "types", "session.ts"), "utf8");
+    assert.ok(mainJs.includes("finishReason"), "main 流结束 chunk 必须回传 finishReason");
+    assert.ok(mainJs.includes("lastFinishReason"), "main 必须从 SSE 捕获 finish_reason/stop_reason");
+    assert.ok(mainJs.includes("180000"), "静默超时应为 180s");
+    assert.ok(app.includes("looksLikeEarlyEnd"), "App 必须区分提前结束与传输中断");
+    assert.ok(app.includes("[输出提前结束]"), "提前结束须使用明确文案");
+    assert.ok(app.includes("handleContinueGeneration"), "App 必须提供继续生成");
+    assert.ok(app.includes("workDurationSec"), "App 必须写入真实工作耗时");
+    assert.ok(sessionTs.includes("workDurationSec"), "消息类型须含 workDurationSec");
+    assert.ok(chat.includes("msg.workDurationSec"), "ChatStream 结束后须用真实耗时");
+    assert.ok(!chat.includes("thinking?.length || 120) / 45"), "禁止再用 thinking 字数估算「已工作」秒数");
+    assert.ok(chat.includes("继续生成"), "截断消息须有继续生成按钮");
+    assert.ok(app.includes("❌ [传输中断]"), "真失败路径仍保留传输中断文案");
+    assert.ok(app.includes("toolsExhaustedIncomplete"), "工具轮打满仍挂 tool 时须标提前结束");
+    assert.ok(app.includes("lastLine.length >= 24"), "半截长句启发式必须存在");
+    assert.ok(!app.includes("!pendingToolsLeft &&"), "不得再因 pending tools 跳过提前结束");
+    assert.ok(app.includes("pickRelativePath"), "读/写工具须兼容 path 别名");
+    assert.ok(app.includes("tool_close") || app.includes("_tool_close"), "工具末轮须强制收束要终答");
+    assert.ok(app.includes("EARLY_END_NOTE_RE") || app.includes("输出提前结束"), "历史提前结束提示须从上下文剥离");
+    assert.ok(app.includes("/[\\u4e00-\\u9fff]/") || app.includes("\\u4e00-\\u9fff"), "半截句启发式须限制中文以避免英文误报");
+    assert.ok(!/earlyEnded:\s*true/.test(app.split("传输中断")[1]?.slice(0, 400) || ""), "传输中断路径不得再设 earlyEnded");
+    assert.ok(chat.includes("[输出提前结束]"), "提前结束提示应在 ChatStream UI 展示");
+  });
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, '/')}`) {

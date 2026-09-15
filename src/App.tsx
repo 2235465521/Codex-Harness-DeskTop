@@ -27,6 +27,47 @@ function normalizeFsPath(p?: string | null): string {
   return p.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
+/** 上游正常关流但正文疑似提前结束（额度 / 未闭合围栏 / 半截句） */
+function looksLikeEarlyEnd(content: string, finishReason?: string): boolean {
+  const fr = String(finishReason || '').toLowerCase();
+  if (fr === 'length' || fr === 'max_tokens') return true;
+  // 工具调用收束本身不算正文截断；轮次打满仍挂 tool 由调用方单独标记
+  if (fr === 'tool_calls' || fr === 'tool_use') return false;
+
+  const text = String(content || '').replace(/\s+$/u, '');
+  if (!text) return false;
+
+  const fences = (text.match(/```/g) || []).length;
+  if (fences % 2 === 1) return true;
+
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const lastLine = lines[lines.length - 1] || '';
+  if (/[,，、:：;；]\s*$/u.test(lastLine)) return true;
+
+  // 半截长句：仅对含中文的末行启用，避免英文无句号段落误报
+  if (
+    lastLine.length >= 24 &&
+    /[\u4e00-\u9fff]/.test(lastLine) &&
+    !/([.!?。！？…」』）\]}`])\s*$/u.test(lastLine) &&
+    !/^#{1,6}\s/.test(lastLine) &&
+    !/^[-*]\s+\S+$/u.test(lastLine.trim())
+  ) {
+    return true;
+  }
+  return false;
+}
+
+const EARLY_END_MARKER = '[输出提前结束]';
+const EARLY_END_NOTE_RE = /\n*\n⚠️\s*\[输出提前结束\][^\n]*(?:\n(?!\n)[^\n]*)*$/u;
+const CONTINUE_PROMPT = '请从上次中断处继续写完，不要重复已输出的内容。';
+
+/** 兼容模型误传 path / file */
+function pickRelativePath(args: Record<string, unknown> | null | undefined): string {
+  if (!args || typeof args !== 'object') return '';
+  const raw = args.relativePath ?? args.path ?? args.file;
+  return String(raw ?? '').trim();
+}
+
 const AT_FILE_EXT = 'docx|xlsx|xls|pdf|doc|pptx|txt|md|json|js|jsx|ts|tsx|mjs|cjs|py|css|html|htm|yml|yaml|xml|csv|sh|ps1|java|go|rs|toml|ini|vue';
 
 /** 从消息里抽出 @路径。支持中文、空格，以及 @"路径" 引号形式。 */
@@ -151,7 +192,7 @@ async function executeWriteWorkspaceTools(
       results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
       continue;
     }
-    let args: { relativePath?: string; content?: string } = {};
+    let args: { relativePath?: string; path?: string; file?: string; content?: string } = {};
     try {
       args = JSON.parse(tc.arguments || '{}');
     } catch {
@@ -160,7 +201,7 @@ async function executeWriteWorkspaceTools(
       results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
       continue;
     }
-    const relativePath = String(args.relativePath || '').trim();
+    const relativePath = pickRelativePath(args as Record<string, unknown>);
     const content = typeof args.content === 'string' ? args.content : '';
     if (!relativePath || !content) {
       const msg = 'write_workspace_file 缺少 relativePath 或 content';
@@ -224,7 +265,7 @@ async function executeReadWorkspaceTools(
       results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
       continue;
     }
-    let args: { relativePath?: string } = {};
+    let args: { relativePath?: string; path?: string; file?: string } = {};
     try {
       args = JSON.parse(tc.arguments || '{}');
     } catch {
@@ -233,7 +274,7 @@ async function executeReadWorkspaceTools(
       results.push({ id: callId, name: tc.name, content: JSON.stringify({ ok: false, error: msg }) });
       continue;
     }
-    const relativePath = String(args.relativePath || '').trim();
+    const relativePath = pickRelativePath(args as Record<string, unknown>);
     if (!relativePath) {
       const msg = 'read_workspace_file 缺少 relativePath';
       lines.push(`- ❌ ${msg}`);
@@ -788,6 +829,8 @@ export const App: React.FC = () => {
     addMessageToCurrentSession(userMsg);
 
     let unsubscribeStream: (() => void) | null = null;
+    let sendStartTime = Date.now();
+    let streamFinishReason = '';
 
     try {
       // 查找当前所选模型归属的提供方及模型专属配置
@@ -887,6 +930,13 @@ export const App: React.FC = () => {
           if (m.role === 'assistant') {
             // 清洗阶段 1: 过滤等待交互的截断词
             cleanedContent = cleanedContent.replace(/(?:让我读取.*?[：:]|先从.*?开始[：:])\s*$/g, '').trim();
+            // 清洗：历史「输出提前结束」UI 提示不得进入模型上下文
+            cleanedContent = cleanedContent.replace(EARLY_END_NOTE_RE, '').trim();
+            cleanedContent = cleanedContent
+              .split('\n')
+              .filter((line) => !line.includes(EARLY_END_MARKER))
+              .join('\n')
+              .trim();
             // 清洗阶段 2: 过滤大模型历史中“无法写文件/需用户手动操作”的推诿话术，彻底阻断抬杠自洽链
             cleanedContent = cleanedContent
               .replace(/(?:直说[：:]\s*不能[^\n]*\n?)/gi, '')
@@ -965,7 +1015,7 @@ export const App: React.FC = () => {
       // 统计输入字符与估算输入 Token 规模
       const totalInputChars = contextMessages.reduce((acc, m) => acc + (typeof m.content === 'string' ? m.content.length : 0), 0);
       const estimatedInputTokens = Math.max(1, Math.round(totalInputChars / 2.5));
-      const sendStartTime = Date.now();
+      sendStartTime = Date.now();
       let firstTokenTime: number | null = null;
       let accumulatedChars = 0;
 
@@ -1032,14 +1082,17 @@ export const App: React.FC = () => {
               }));
             }
 
-            if (data.isDone && Array.isArray(data.toolCalls) && data.toolCalls.length > 0) {
-              collectedToolCalls = data.toolCalls
-                .filter((t: any) => t && t.name)
-                .map((t: any) => ({
-                  id: t.id,
-                  name: t.name,
-                  arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {}),
-                }));
+            if (data.isDone) {
+              if (data.finishReason) streamFinishReason = String(data.finishReason);
+              if (Array.isArray(data.toolCalls) && data.toolCalls.length > 0) {
+                collectedToolCalls = data.toolCalls
+                  .filter((t: any) => t && t.name)
+                  .map((t: any) => ({
+                    id: t.id,
+                    name: t.name,
+                    arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {}),
+                  }));
+              }
             }
           }
         });
@@ -1171,6 +1224,8 @@ export const App: React.FC = () => {
             const text = choice?.message?.content || parsed.message?.content || parsed.response || '';
             const thinking = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
             response = { content: text, thinking };
+            if (choice?.finish_reason) streamFinishReason = String(choice.finish_reason);
+            else if (parsed.finish_reason) streamFinishReason = String(parsed.finish_reason);
             if (Array.isArray(parsed.codex_tool_calls) && parsed.codex_tool_calls.length) {
               collectedToolCalls = parsed.codex_tool_calls;
             } else if (Array.isArray(choice?.message?.tool_calls)) {
@@ -1180,6 +1235,11 @@ export const App: React.FC = () => {
                 arguments: tc.function?.arguments || '{}',
               }));
             }
+          }
+
+          // Anthropic 顶层 stop_reason
+          if (effectiveProtocol === 'anthropic' && parsed.stop_reason) {
+            streamFinishReason = String(parsed.stop_reason);
           }
 
           // 工具调用常只回 tool_calls、正文为空。此时不要写成鉴权失败，等工具续跑后再显示正文或执行结果。
@@ -1295,14 +1355,17 @@ export const App: React.FC = () => {
                         thinking: (prev.thinking || '') + data.thinkingDelta,
                       }));
                     }
-                    if (data.isDone && Array.isArray(data.toolCalls) && data.toolCalls.length > 0) {
-                      contToolCalls = data.toolCalls
-                        .filter((t: any) => t && t.name)
-                        .map((t: any) => ({
-                          id: t.id,
-                          name: t.name,
-                          arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {}),
-                        }));
+                    if (data.isDone) {
+                      if (data.finishReason) streamFinishReason = String(data.finishReason);
+                      if (Array.isArray(data.toolCalls) && data.toolCalls.length > 0) {
+                        contToolCalls = data.toolCalls
+                          .filter((t: any) => t && t.name)
+                          .map((t: any) => ({
+                            id: t.id,
+                            name: t.name,
+                            arguments: typeof t.arguments === 'string' ? t.arguments : JSON.stringify(t.arguments || {}),
+                          }));
+                      }
                     }
                   });
                 }
@@ -1406,6 +1469,156 @@ export const App: React.FC = () => {
                 toolResults.push(...next.lines);
                 results = next.results;
               }
+
+              // 末轮收束：工具已执行但结果尚未回传模型时，再请求一次且不挂工具，避免停在「已读取」无终答
+              if (lastApiToolCalls.length > 0 && results.length > 0 && activeStreamIdRef.current) {
+                if (effectiveProtocol === 'anthropic') {
+                  const assistantContent: any[] = [];
+                  if (lastAssistantText.trim()) {
+                    assistantContent.push({ type: 'text', text: lastAssistantText });
+                  }
+                  for (const tc of lastApiToolCalls) {
+                    let input: any = {};
+                    try { input = JSON.parse(tc.arguments || '{}'); } catch { input = {}; }
+                    assistantContent.push({
+                      type: 'tool_use',
+                      id: tc.id,
+                      name: tc.name,
+                      input,
+                    });
+                  }
+                  roundMessages = [
+                    ...roundMessages,
+                    { role: 'assistant', content: assistantContent },
+                    {
+                      role: 'user',
+                      content: results.map((r) => ({
+                        type: 'tool_result',
+                        tool_use_id: r.id,
+                        content: r.content,
+                      })),
+                    },
+                  ];
+                } else {
+                  roundMessages = [
+                    ...roundMessages,
+                    {
+                      role: 'assistant',
+                      content: lastAssistantText || null,
+                      tool_calls: lastApiToolCalls.map((tc) => ({
+                        id: tc.id,
+                        type: 'function',
+                        function: { name: tc.name, arguments: tc.arguments || '{}' },
+                      })),
+                    },
+                    ...results.map((r) => ({
+                      role: 'tool',
+                      tool_call_id: r.id,
+                      content: r.content,
+                    })),
+                  ];
+                }
+
+                updateLastMessageInCurrentSession((prev) => ({
+                  ...prev,
+                  thinking: `${prev.thinking || ''}\n🔄 工具结果已回传，正在生成最终回复...`.trim(),
+                }));
+
+                const closeStreamId = `${streamId}_tool_close`;
+                activeStreamIdRef.current = closeStreamId;
+                let closeContentAcc = '';
+                if (unsubscribeStream) {
+                  unsubscribeStream();
+                  unsubscribeStream = null;
+                }
+                if (window.codexDesktop?.onLlmStreamChunk) {
+                  unsubscribeStream = window.codexDesktop.onLlmStreamChunk((data) => {
+                    if (data.streamId !== closeStreamId) return;
+                    if (data.contentDelta) {
+                      closeContentAcc += data.contentDelta;
+                      updateLastMessageInCurrentSession((prev) => ({
+                        ...prev,
+                        content: (prev.content || '') + data.contentDelta,
+                      }));
+                    }
+                    if (data.thinkingDelta) {
+                      updateLastMessageInCurrentSession((prev) => ({
+                        ...prev,
+                        thinking: (prev.thinking || '') + data.thinkingDelta,
+                      }));
+                    }
+                    if (data.isDone && data.finishReason) {
+                      streamFinishReason = String(data.finishReason);
+                    }
+                  });
+                }
+
+                let closeEndpoint = effectiveBaseUrl;
+                let closeBody: any = {};
+                if (effectiveProtocol === 'anthropic') {
+                  if (!closeEndpoint.endsWith('/messages')) closeEndpoint += '/v1/messages';
+                  const systemPrompts = roundMessages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
+                  closeBody = {
+                    model: selectedModel,
+                    max_tokens: effectiveMaxTokens,
+                    stream: true,
+                    messages: roundMessages.filter((m) => m.role !== 'system'),
+                    system: systemPrompts || undefined,
+                  };
+                } else {
+                  if (effectiveProtocol === 'ollama') {
+                    if (!closeEndpoint.endsWith('/chat/completions') && !closeEndpoint.endsWith('/api/chat')) {
+                      closeEndpoint += '/v1/chat/completions';
+                    }
+                  } else if (!closeEndpoint.endsWith('/chat/completions')) {
+                    closeEndpoint += '/chat/completions';
+                  }
+                  closeBody = {
+                    model: selectedModel,
+                    stream: true,
+                    max_tokens: effectiveMaxTokens,
+                    messages: roundMessages,
+                  };
+                }
+
+                const closeRes: any = await window.codexDesktop.callLlmApi({
+                  endpoint: closeEndpoint,
+                  apiKey: effectiveApiKey,
+                  body: closeBody,
+                  stream: true,
+                  streamId: closeStreamId,
+                  timeout: matchedModel?.timeoutSeconds,
+                });
+
+                if (closeRes?.ok) {
+                  try {
+                    const closeParsed = typeof closeRes.body === 'string' ? JSON.parse(closeRes.body) : closeRes.body;
+                    if (effectiveProtocol === 'anthropic') {
+                      const text = (closeParsed.content || []).map((c: any) => c.text || '').join('');
+                      if (!closeContentAcc && text) {
+                        updateLastMessageInCurrentSession((prev) => ({
+                          ...prev,
+                          content: `${prev.content || ''}${text}`,
+                        }));
+                      }
+                      if (closeParsed.stop_reason) streamFinishReason = String(closeParsed.stop_reason);
+                    } else {
+                      const choice = closeParsed.choices?.[0];
+                      const text = choice?.message?.content || '';
+                      if (!closeContentAcc && text) {
+                        updateLastMessageInCurrentSession((prev) => ({
+                          ...prev,
+                          content: `${prev.content || ''}${text}`,
+                        }));
+                      }
+                      if (choice?.finish_reason) streamFinishReason = String(choice.finish_reason);
+                    }
+                  } catch {
+                    /* 流式已增量写入 */
+                  }
+                  lastApiToolCalls = [];
+                }
+              }
             }
 
             if (canUseWriteTools) {
@@ -1434,6 +1647,19 @@ export const App: React.FC = () => {
                 content: `${prev.content || ''}\n\n---\n**🔧 工具执行结果**\n${toolResults.join('\n')}`.trim(),
               }));
             }
+
+            // 正常关流但疑似截断：只打 earlyEnded 标记，文案在 UI 展示，避免污染后续上下文
+            updateLastMessageInCurrentSession((prev) => {
+              const body = (prev.content || '').replace(EARLY_END_NOTE_RE, '').trim();
+              const toolsExhaustedIncomplete = lastApiToolCalls.length > 0;
+              const early =
+                toolsExhaustedIncomplete || looksLikeEarlyEnd(body, streamFinishReason);
+              return {
+                ...prev,
+                content: body,
+                earlyEnded: early || Boolean(prev.earlyEnded),
+              };
+            });
           }
         } else {
           let errText = rawRes?.body;
@@ -1477,9 +1703,14 @@ export const App: React.FC = () => {
         content: prev.content
           ? `${prev.content}\n\n❌ [传输中断]: ${friendlyError}`
           : `❌ 请求失败: ${friendlyError}`,
-        thinking: '执行异常'
+        thinking: '执行异常',
       }));
     } finally {
+      const workDurationSec = Math.max(1, Math.round((Date.now() - sendStartTime) / 1000));
+      updateLastMessageInCurrentSession((prev) => ({
+        ...prev,
+        workDurationSec: prev.workDurationSec || workDurationSec,
+      }));
       activeStreamIdRef.current = null;
       if (unsubscribeStream) {
         unsubscribeStream();
@@ -1490,6 +1721,11 @@ export const App: React.FC = () => {
         isGenerating: false
       }));
     }
+  };
+
+  const handleContinueGeneration = () => {
+    if (isGenerating) return;
+    handleSend(CONTINUE_PROMPT, []);
   };
 
   // 主动停止当前正在流式生成的任务并切断网络连接
@@ -1642,6 +1878,7 @@ export const App: React.FC = () => {
             onRevokeMessage={handleRevokeMessage}
             onOpenFileDiff={handleFileWritten}
             onRevertFile={handleRevertFile}
+            onContinueGeneration={handleContinueGeneration}
           />
 
           {/* 底部 Composer 输入区 */}

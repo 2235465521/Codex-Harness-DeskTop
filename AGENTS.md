@@ -37,9 +37,9 @@ codex-desktop/
 │   ├── upload_release.mjs   # GitHub Releases 自动化上传脚本
 │   └── check-skills.mjs     # 43 项技能结构、元数据与 YAML 合规性零依赖静态健康扫描器
 ├── tests/                   # 18 大 Seam 边界全自动化 TDD 测试套件
-│   ├── run-all-tests.mjs    # 主测试执行器 (58 项核心单元与集成断言)
+│   ├── run-all-tests.mjs    # 主测试执行器
 │   ├── workspace-security.test.mjs # Seam 17 主进程权威安全沙箱攻击防护测试 (15+ 项向量断言)
-│   ├── interaction-features.test.mjs # Seam 18 流式打断与消息撤回状态机专项测试 (4 项断言)
+│   ├── interaction-features.test.mjs # Seam 18 流式打断、消息撤回、读/写工具与附件
 │   ├── renderer-behavior.test.mjs # 渲染层 VM + DOM 桩行为测试
 │   └── reply-parsing.test.mjs     # LLM 响应解析与防 HTML 误判测试
 ├── release/                 # 发布产物与安装包归档目录
@@ -89,6 +89,11 @@ codex-desktop/
 8. **流式生成打断与对话撤回状态机 (Seam 18)**：
    - 模型流式吐字中支持随时主动掐断，主进程通过 `activeLlmStreams` 映射表立即调用底层 `req.destroy()` 断开网络，杜绝多余流量与计费；
    - 用户消息支持一键撤回该轮问答并原样回填至输入框（自动打断正在进行的生成），方便用户修正提示词后重新提交。
-9. **跨平台原生环境与技能健康静态扫描 (Seam 8.5)**：
-   - 所有随附执行脚本优先提供跨平台 Node.js 原生实现，严禁单向依赖特定操作系统 Shell（如 POSIX-only Bash / jq）；
-   - 新增或调整技能必须通过 `scripts/check-skills.mjs` 静态断言，强制守卫 `SKILL.md` 元数据完整性、严禁在 YAML 中使用制表符 (Tab) 缩进，且测试结果临时文件一律禁止入库。
+9. **模型工具与附件正文**：
+   - `read_workspace_file` 只接受相对工作区根目录的 `relativePath`。`chat-only` 不挂载；只读、读写、全局信任可调用。写盘仍是 `write_workspace_file`，纯对话和只读都禁止写。
+   - `.docx` 与文字型 PDF 必须抽取正文。不要把 Office/PDF 二进制当 UTF-8。`.xlsx` / `.xls` / `.doc` / `.pptx` 仍拒绝。扫描件 PDF 无文字层时必须失败，不要假装读到了正文。
+   - 流正常结束（对端关流、输出额度用尽、只回了工具调用）不会自动打出「传输中断」。只有静默超时、对端异常断开（EOF / hang up）或用户点停止才追加该提示。空正文不要归咎于 API Key。
+10. **跨平台原生环境与技能健康静态扫描 (Seam 8.5)**：
+
+- 所有随附执行脚本优先提供跨平台 Node.js 原生实现，严禁单向依赖特定操作系统 Shell（如 POSIX-only Bash / jq）；
+- 新增或调整技能必须通过 `scripts/check-skills.mjs` 静态断言，强制守卫 `SKILL.md` 元数据完整性、严禁在 YAML 中使用制表符 (Tab) 缩进，且测试结果临时文件一律禁止入库。

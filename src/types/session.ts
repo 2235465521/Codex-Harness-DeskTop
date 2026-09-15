@@ -8,6 +8,10 @@ export interface ChatMessage {
   content: string;
   model?: string;
   thinking?: string;
+  /** 本轮真实墙上耗时（秒），生成结束后写入；禁止再用 thinking 字数估算 */
+  workDurationSec?: number;
+  /** 上游正常关流但正文疑似截断（额度用尽等），可一键继续 */
+  earlyEnded?: boolean;
   toolCall?: any;
   images?: string[]; // base64 or local paths
   timestamp: number;

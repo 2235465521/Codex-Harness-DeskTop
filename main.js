@@ -2116,7 +2116,7 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
       ? userTimeout * 1000
       : Math.min(300000, 120000 + Math.floor(payloadBytes / 1000) * 15000);
 
-    const rollingInactivityMs = 90000; // 数据流入后的空闲静默容忍度 (90s)
+    const rollingInactivityMs = 180000; // 数据流入后的空闲静默容忍度 (180s，长推理模型可能长时间只出 thinking)
 
     // 单次底层网络请求执行体
     const runAttempt = (attemptIndex, forceNewConnection = false) => {
@@ -2126,6 +2126,7 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
         let sseBuffer = "";
         let accumulatedText = "";
         let accumulatedThinking = "";
+        let lastFinishReason = "";
         // OpenAI tool_calls 按 index 累加（Wave D：真正执行写盘工具）
         const pendingToolCalls = {};
 
@@ -2176,7 +2177,7 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
               hasReceivedFirstByte = true;
             }
             // 只要数据流在持续流动，每次接收到数据块均自动刷新心跳计时器
-            setTimer(rollingInactivityMs, "数据流传输静默超时 (90s)，服务端可能已意外断开");
+            setTimer(rollingInactivityMs, "数据流传输静默超时 (180s)，服务端可能已意外断开");
             responseBody += chunk;
 
             // 若开启了流式模式且响应正常，进行实时 SSE 事件流解析
@@ -2197,6 +2198,13 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
                   const choice = parsed.choices?.[0];
                   const deltaText = choice?.delta?.content || "";
                   const deltaThinking = choice?.delta?.reasoning_content || choice?.delta?.reasoning || "";
+                  if (choice?.finish_reason) lastFinishReason = String(choice.finish_reason);
+                  if (parsed.type === "message_delta" && parsed.delta?.stop_reason) {
+                    lastFinishReason = String(parsed.delta.stop_reason);
+                  }
+                  if (parsed.type === "message_stop" && parsed.stop_reason) {
+                    lastFinishReason = String(parsed.stop_reason);
+                  }
 
                   // 捕获 OpenAI 格式的工具调用并累加参数，不写入聊天正文（避免污染 Apply 解析）
                   const toolCalls = choice?.delta?.tool_calls;
@@ -2298,7 +2306,8 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
               event.sender.send("llm-stream-chunk", {
                 streamId,
                 isDone: true,
-                toolCalls: finishedToolCalls
+                toolCalls: finishedToolCalls,
+                finishReason: lastFinishReason || undefined
               });
             }
 
@@ -2307,6 +2316,7 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
             if (stream && (accumulatedText || finishedToolCalls.length > 0)) {
               finalBody = JSON.stringify({
                 choices: [{
+                  finish_reason: lastFinishReason || (finishedToolCalls.length ? "tool_calls" : "stop"),
                   message: {
                     content: accumulatedText,
                     reasoning_content: accumulatedThinking,
@@ -2317,7 +2327,8 @@ ipcMain.handle("save-temp-image", async (_event, base64Data) => {
                     }))
                   }
                 }],
-                codex_tool_calls: finishedToolCalls
+                codex_tool_calls: finishedToolCalls,
+                finish_reason: lastFinishReason || undefined
               });
             }
 
@@ -2591,7 +2602,7 @@ ipcMain.handle("extract-pdf-text", async (_event, payload = {}) => {
   }
 });
 
-ipcMain.handle("read-workspace-file", async (_event, payload) => {
+  ipcMain.handle("read-workspace-file", async (_event, payload) => {
     const relativePath = typeof payload === "string" ? payload : payload?.relativePath;
     if (!relativePath || typeof relativePath !== "string") {
       return {
